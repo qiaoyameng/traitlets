@@ -86,6 +86,7 @@ __all__ = [
     "CaselessStrEnum",
     "ClassBasedTraitType",
     "Complex",
+    "Computed",
     "Container",
     "DefaultHandler",
     "Dict",
@@ -121,6 +122,7 @@ __all__ = [
     "Union",
     "UseEnum",
     "ValidateHandler",
+    "computed",
     "default",
     "directional_link",
     "dlink",
@@ -940,6 +942,122 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
 
 
 # -----------------------------------------------------------------------------
+# Computed traits
+# -----------------------------------------------------------------------------
+
+
+class Computed(TraitType[G, t.Any]):
+    """A read-only trait whose value is derived from other traits.
+
+    A ``Computed`` trait explicitly declares the traits it depends on and a
+    ``compute`` function producing its value.  The value is computed lazily on
+    first access and cached on the instance; whenever one of the declared
+    dependencies changes, the cached value is invalidated and recomputed on
+    the next access.  Because recomputation only happens on access, batching
+    several changes inside a single :meth:`HasTraits.hold_trait_notifications`
+    block does not trigger repeated recomputation.
+
+    Computed traits may depend on other computed traits, forming a dependency
+    graph.  Dependencies are validated when the class is defined: referencing
+    a trait that does not exist on the final class, or creating a cycle of
+    computed traits, raises a :class:`TraitError`.  If the ``compute``
+    function raises, the error propagates and nothing is cached, so the next
+    access retries the computation.
+
+    Parameters
+    ----------
+    *depends_on : str
+        Names of the traits this value is computed from.
+    compute : callable
+        A function taking the ``HasTraits`` instance and returning the
+        computed value.
+
+    Examples
+    --------
+    >>> class Server(HasTraits):
+    ...     host = Unicode("localhost")
+    ...     port = Int(8080)
+    ...     endpoint = Computed(
+    ...         "host", "port",
+    ...         compute=lambda server: f"http://{server.host}:{server.port}",
+    ...     )
+    """
+
+    read_only = True
+    info_text = "a computed value"
+
+    def __init__(
+        self,
+        *depends_on: str,
+        compute: t.Callable[[t.Any], G] | None = None,
+        help: str | None = None,
+    ) -> None:
+        for name in depends_on:
+            if not isinstance(name, str):
+                raise TraitError(
+                    "Computed trait dependencies must be strings, "
+                    f"not {type(name).__name__}({name!r})"
+                )
+        if compute is None:
+            raise TraitError("A Computed trait requires a `compute` function.")
+        if not callable(compute):
+            raise TraitError("The `compute` argument of a Computed trait must be callable.")
+        self.depends_on = tuple(depends_on)
+        self.compute = compute
+        super().__init__(read_only=True, help=help)
+
+    def subclass_init(self, cls: type[t.Any]) -> None:
+        pass  # fully opt out of instance_init
+
+    def get(self, obj: HasTraits, cls: type[t.Any] | None = None) -> G:
+        assert self.name is not None
+        cache = obj.__dict__.setdefault("_computed_cache", {})
+        try:
+            return cache[self.name]  # type:ignore[no-any-return]
+        except KeyError:
+            pass
+        # A failing computation must not be cached as a valid value:
+        # the exception propagates and the next access retries.
+        value = self.compute(obj)
+        cache[self.name] = value
+        return value
+
+    def set(self, obj: HasTraits, value: t.Any) -> None:
+        raise TraitError(f'The "{self.name}" trait is computed and cannot be set.')
+
+    def __delete__(self, obj: HasTraits) -> None:
+        assert self.name is not None
+        cache = obj.__dict__.get("_computed_cache")
+        if cache is not None:
+            cache.pop(self.name, None)
+
+
+def computed(*depends_on: str) -> t.Callable[[t.Callable[[t.Any], G]], Computed[G, t.Any]]:
+    """Decorator declaring a read-only computed trait from a function.
+
+    Parameters
+    ----------
+    *depends_on : str
+        Names of the traits the decorated function depends on.
+
+    Examples
+    --------
+    >>> class Server(HasTraits):
+    ...     host = Unicode("localhost")
+    ...     port = Int(8080)
+    ...
+    ...     @computed("host", "port")
+    ...     def endpoint(self):
+    ...         return f"http://{self.host}:{self.port}"
+    """
+
+    def decorator(func: t.Callable[[t.Any], G]) -> Computed[G, t.Any]:
+        return Computed(*depends_on, compute=func)
+
+    return decorator
+
+
+# -----------------------------------------------------------------------------
 # The HasTraits implementation
 # -----------------------------------------------------------------------------
 
@@ -992,6 +1110,71 @@ def _callback_wrapper(cb: t.Any) -> _CallbackWrapper:
         return cb
     else:
         return _CallbackWrapper(cb)
+
+
+def _setup_computed_traits(cls: type[HasTraits]) -> dict[str, frozenset[str]]:
+    """Validate the Computed traits of a HasTraits subclass.
+
+    Validation happens against the final class definition (``cls._traits``
+    includes inherited and overridden traits), so overriding a dependency in
+    a subclass is taken into account.  Returns a mapping of trait name to the
+    computed traits that transitively depend on it, used to invalidate cached
+    values when a source trait changes.
+    """
+    computed: dict[str, Computed[t.Any, t.Any]] = {
+        name: trait for name, trait in cls._traits.items() if isinstance(trait, Computed)
+    }
+    if not computed:
+        return {}
+
+    for name, trait in computed.items():
+        for dep in trait.depends_on:
+            if dep not in cls._traits:
+                raise TraitError(
+                    f"The {name!r} computed trait of {cls.__name__!r} depends on "
+                    f"{dep!r}, which is not a trait of {cls.__name__!r}."
+                )
+
+    # Detect cycles among computed traits (dependencies on plain traits
+    # cannot lead back to a computed trait).
+    visiting: list[str] = []
+    done: set[str] = set()
+
+    def check_cycles(name: str) -> None:
+        if name in visiting:
+            cycle = " -> ".join([*visiting[visiting.index(name) :], name])
+            raise TraitError(
+                f"Cycle detected in the computed traits of {cls.__name__!r}: {cycle}"
+            )
+        if name in done:
+            return
+        visiting.append(name)
+        for dep in computed[name].depends_on:
+            if dep in computed:
+                check_cycles(dep)
+        visiting.pop()
+        done.add(name)
+
+    for name in computed:
+        check_cycles(name)
+
+    # Map every dependency (source traits and intermediate computed traits)
+    # to all computed traits that transitively depend on it.
+    dependents: dict[str, set[str]] = {}
+
+    def record_dependencies(origin: str, name: str, seen: set[str]) -> None:
+        for dep in computed[name].depends_on:
+            if dep in seen:
+                continue
+            seen.add(dep)
+            dependents.setdefault(dep, set()).add(origin)
+            if dep in computed:
+                record_dependencies(origin, dep, seen)
+
+    for name in computed:
+        record_dependencies(name, name, set())
+
+    return {name: frozenset(names) for name, names in dependents.items()}
 
 
 class MetaHasDescriptors(type):
@@ -1138,6 +1321,8 @@ class MetaHasTraits(MetaHasDescriptors):
                     # we always add it, because a class may change when we call add_trait
                     # and then the instance may not have all the _static_immutable_initial_values
                     cls._all_trait_default_generators[name] = trait.default
+
+        cls._computed_dependents = _setup_computed_traits(cls)
 
 
 def observe(*names: Sentinel | str, type: str = "change") -> ObserveHandler:
@@ -1373,6 +1558,7 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _cross_validation_lock: bool
     _traits: dict[str, t.Any]
     _all_trait_default_generators: dict[str, t.Any]
+    _computed_dependents: dict[str, frozenset[str]]
 
     def setup_instance(self, /, *args: t.Any, **kwargs: t.Any) -> None:
         # although we'd prefer to set only the initial values not present
@@ -1556,6 +1742,8 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                         self.notify_change(change)
 
     def _notify_trait(self, name: str, old_value: t.Any, new_value: t.Any) -> None:
+        if self._computed_dependents:
+            self._invalidate_computed(name)
         self.notify_change(
             Bunch(
                 name=name,
@@ -1565,6 +1753,20 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                 type="change",
             )
         )
+
+    def _invalidate_computed(self, name: str) -> None:
+        """Invalidate the cached values of computed traits depending on ``name``.
+
+        Invalidation only drops cached values; recomputation happens lazily on
+        the next access, so repeated changes (e.g. inside a single
+        ``hold_trait_notifications`` block) do not trigger recomputation.
+        """
+        dependents = self._computed_dependents.get(name)
+        if dependents:
+            cache = self.__dict__.get("_computed_cache")
+            if cache:
+                for computed_name in dependents:
+                    cache.pop(computed_name, None)
 
     def notify_change(self, change: Bunch) -> None:
         """Notify observers of a change event"""

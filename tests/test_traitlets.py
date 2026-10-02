@@ -30,6 +30,7 @@ from traitlets import (
     Complex,
     CRegExp,
     CUnicode,
+    Computed,
     Dict,
     DottedObjectName,
     Enum,
@@ -56,6 +57,7 @@ from traitlets import (
     Undefined,
     Unicode,
     Union,
+    computed,
     default,
     directional_link,
     link,
@@ -3215,3 +3217,229 @@ def test_mock_patch():
     with mock.patch.object(a, "trait", "patch"):
         assert a.trait == "patch"
     assert a.trait == "set"
+
+
+# -----------------------------------------------------------------------------
+# Computed traits
+# -----------------------------------------------------------------------------
+
+
+class ComputedServer(HasTraits):
+    host = Unicode("localhost")
+    port = Int(8080)
+    scheme = Unicode("http")
+
+    def __init__(self, *args, **kwargs):
+        self.compute_counts = {"endpoint": 0, "base_url": 0}
+        super().__init__(*args, **kwargs)
+
+    @computed("host", "port")
+    def endpoint(self):
+        self.compute_counts["endpoint"] += 1
+        return f"{self.host}:{self.port}"
+
+    @computed("scheme", "endpoint")
+    def base_url(self):
+        self.compute_counts["base_url"] += 1
+        return f"{self.scheme}://{self.endpoint}"
+
+
+def test_computed_basic():
+    server = ComputedServer()
+    assert server.endpoint == "localhost:8080"
+    assert server.base_url == "http://localhost:8080"
+
+
+def test_computed_is_lazy_and_cached():
+    server = ComputedServer()
+    assert server.compute_counts["endpoint"] == 0
+    server.host = "example.com"
+    # invalidation does not recompute on its own
+    assert server.compute_counts["endpoint"] == 0
+    assert server.endpoint == "example.com:8080"
+    assert server.compute_counts["endpoint"] == 1
+    # cached until a dependency changes
+    assert server.endpoint == "example.com:8080"
+    assert server.compute_counts["endpoint"] == 1
+
+
+def test_computed_read_only():
+    server = ComputedServer()
+    with pytest.raises(TraitError):
+        server.endpoint = "nope"
+    with pytest.raises(TraitError):
+        server.set_trait("endpoint", "nope")
+    with pytest.raises(TraitError):
+        ComputedServer(endpoint="nope")
+
+
+def test_computed_requires_compute_function():
+    with pytest.raises(TraitError):
+        Computed("host")
+    with pytest.raises(TraitError):
+        Computed("host", compute="not-callable")
+    with pytest.raises(TraitError):
+        Computed(42, compute=lambda obj: 42)
+
+
+def test_computed_missing_dependency():
+    with pytest.raises(TraitError):
+
+        class MissingDep(HasTraits):
+            host = Unicode()
+            endpoint = Computed("host", "port", compute=lambda obj: "")
+
+
+def test_computed_cycle_detection():
+    with pytest.raises(TraitError):
+
+        class DirectCycle(HasTraits):
+            a = Computed("b", compute=lambda obj: 1)
+            b = Computed("a", compute=lambda obj: 2)
+
+    with pytest.raises(TraitError):
+
+        class IndirectCycle(HasTraits):
+            a = Computed("b", compute=lambda obj: 1)
+            b = Computed("c", compute=lambda obj: 2)
+            c = Computed("a", compute=lambda obj: 3)
+
+    with pytest.raises(TraitError):
+
+        class SelfCycle(HasTraits):
+            a = Computed("a", compute=lambda obj: 1)
+
+
+def test_computed_chain_invalidation():
+    server = ComputedServer()
+    assert server.base_url == "http://localhost:8080"
+    assert server.compute_counts == {"endpoint": 1, "base_url": 1}
+    # changing a source invalidates the whole chain
+    server.host = "example.com"
+    assert server.base_url == "http://example.com:8080"
+    assert server.compute_counts == {"endpoint": 2, "base_url": 2}
+    # changing an intermediate dependency only invalidates downstream traits
+    server.scheme = "https"
+    assert server.base_url == "https://example.com:8080"
+    assert server.compute_counts == {"endpoint": 2, "base_url": 3}
+
+
+def test_computed_hold_trait_notifications():
+    server = ComputedServer()
+    assert server.endpoint == "localhost:8080"
+    with server.hold_trait_notifications():
+        server.host = "example.com"
+        server.port = 80
+        server.host = "example.org"
+        # no recomputation while holding notifications
+        assert server.compute_counts["endpoint"] == 1
+    # a single recomputation on demand after the batch
+    assert server.endpoint == "example.org:80"
+    assert server.compute_counts["endpoint"] == 2
+
+
+def test_computed_error_not_cached():
+    class Flaky(HasTraits):
+        n = Int(0)
+
+        @computed("n")
+        def value(self):
+            if self.n == 0:
+                raise ValueError("cannot compute")
+            return self.n * 10
+
+    flaky = Flaky()
+    with pytest.raises(ValueError, match="cannot compute"):
+        flaky.value
+    # the failed computation was not cached as a valid value
+    flaky.n = 3
+    assert flaky.value == 30
+
+
+def test_computed_instance_caches_are_independent():
+    first = ComputedServer()
+    second = ComputedServer()
+    assert first.endpoint == second.endpoint == "localhost:8080"
+    first.host = "example.com"
+    assert first.endpoint == "example.com:8080"
+    # the other instance keeps its own cached value
+    assert second.endpoint == "localhost:8080"
+    assert second.compute_counts["endpoint"] == 1
+
+
+def test_computed_inheritance_override():
+    class SubServer(ComputedServer):
+        port = Int(443)
+        scheme = Unicode("https")
+
+    server = SubServer()
+    assert server.base_url == "https://localhost:443"
+
+    # overriding a dependency with a non-trait is validated against the
+    # final class definition
+    with pytest.raises(TraitError):
+
+        class BrokenServer(ComputedServer):
+            port = 8080
+
+
+def test_computed_add_traits():
+    obj = HasTraits()
+    obj.add_traits(
+        x=Int(2),
+        double=Computed("x", compute=lambda o: o.x * 2),
+    )
+    assert obj.double == 4
+    obj.x = 5
+    assert obj.double == 10
+
+
+def test_computed_delete_recomputes():
+    server = ComputedServer()
+    assert server.endpoint == "localhost:8080"
+    assert server.compute_counts["endpoint"] == 1
+    del server.endpoint
+    assert server.endpoint == "localhost:8080"
+    assert server.compute_counts["endpoint"] == 2
+
+
+def test_computed_diamond_recomputes_common_node_once():
+    counts = {"common": 0, "left": 0, "right": 0, "total": 0}
+
+    class Diamond(HasTraits):
+        a = Int(1)
+        b = Int(2)
+
+        @computed("a", "b")
+        def common(self):
+            counts["common"] += 1
+            return self.a + self.b
+
+        @computed("common")
+        def left(self):
+            counts["left"] += 1
+            return self.common * 2
+
+        @computed("common")
+        def right(self):
+            counts["right"] += 1
+            return self.common * 3
+
+        @computed("left", "right")
+        def total(self):
+            counts["total"] += 1
+            return self.left + self.right
+
+    diamond = Diamond()
+    assert diamond.total == 15
+    assert counts == {"common": 1, "left": 1, "right": 1, "total": 1}
+
+    with diamond.hold_trait_notifications():
+        diamond.a = 10
+        diamond.b = 20
+    # nothing recomputed until the result is actually read
+    assert counts == {"common": 1, "left": 1, "right": 1, "total": 1}
+
+    assert diamond.total == 150
+    # each node of the diamond, including the shared one, recomputed exactly once
+    assert counts == {"common": 2, "left": 2, "right": 2, "total": 2}

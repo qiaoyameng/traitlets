@@ -128,3 +128,12 @@ Miscellaneous
 .. autoclass:: Callable
 
 .. autoclass:: Any
+
+
+Computed traits
+---------------
+
+.. autoclass:: Computed
+   :members: __init__
+
+.. autofunction:: computed
