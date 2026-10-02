@@ -207,6 +207,59 @@ Sometimes it may be impossible to transition between valid states for a
 cross validation until the context manager is released. If a validation error
 occurs, changes are rolled back to the initial state.
 
+Freezing Traits
+---------------
+
+Once a service has finished starting up, it is often desirable to pin its
+configuration traits while keeping runtime fields (counters, caches, ...)
+writable. A trait opts into this by declaring ``freezable=True`` metadata,
+and an instance is then frozen with :meth:`~.HasTraits.freeze`::
+
+    from traitlets import HasTraits, Int, Unicode
+
+
+    class Service(HasTraits):
+        host = Unicode("localhost").tag(freezable=True)
+        port = Int(8080).tag(freezable=True)
+        requests = Int(0)  # no freezable metadata: stays writable
+
+
+    service = Service()
+    service.freeze()
+    service.host = "example.com"  # raises a TraitError
+    service.requests += 1  # runtime traits are unaffected
+
+The freeze applies uniformly to every write path: regular attribute
+assignment, :meth:`~.HasTraits.set_trait`, and loading values from a config
+object (e.g. ``Configurable.update_config``). Freezing never bypasses
+validation — it only rejects writes to freezable traits before they happen,
+while writable traits keep being validated as usual.
+:meth:`~.HasTraits.unfreeze` lifts the freeze permanently, and the
+:attr:`~.HasTraits.frozen` property reports the current state.
+
+For scoped updates — for example a maintenance window — use the
+:meth:`~.HasTraits.temporarily_unfrozen` context manager. It restores the
+previous freeze state on exit, even if the block raises, and it nests::
+
+    with service.temporarily_unfrozen():
+        service.host = "maintenance.example.com"
+        with service.temporarily_unfrozen():
+            service.port = 9090
+    assert service.frozen  # restored, even if an exception was raised above
+
+A few things are worth noting about the semantics:
+
+* Traits added later with :meth:`~.HasTraits.add_traits` are governed by
+  their own ``freezable`` metadata as soon as the freeze is (back) in effect.
+* Reading a trait whose dynamic default has not been computed yet still
+  materializes and caches that default while frozen; only explicit writes
+  are guarded.
+* The freeze is **shallow**: it guards assignment of trait attributes on the
+  instance, but it is not a deep immutable container. Mutating a trait's
+  value in place (e.g. appending to a ``List`` trait's value, or changing a
+  key of a ``Dict``) is still possible. If a value must not be mutated at
+  all, use an immutable value such as a ``Tuple``.
+
 Custom Events
 -------------
 

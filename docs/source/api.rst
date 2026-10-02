@@ -23,6 +23,12 @@ Any class with trait attributes must inherit from :class:`HasTraits`.
 
    .. automethod:: add_traits
 
+   .. automethod:: freeze
+
+   .. automethod:: unfreeze
+
+   .. automethod:: temporarily_unfrozen
+
 You then declare the trait attributes on the class like this::
 
     from traitlets import HasTraits, Int, Unicode

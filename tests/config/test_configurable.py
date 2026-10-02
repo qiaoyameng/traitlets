@@ -32,6 +32,7 @@ from traitlets.traitlets import (
     Integer,
     List,
     Set,
+    TraitError,
     Unicode,
     validate,
 )
@@ -975,3 +976,60 @@ def test_get_log_handler_deprecated():
     app = Application(log=logging.getLogger("test_get_log_handler_deprecated"))
     with pytest.deprecated_call(match="_get_log_handler has been deprecated"):
         app._get_log_handler()
+
+
+class FrozenService(Configurable):
+    """A configurable service whose config traits freeze after startup."""
+
+    host = Unicode("localhost", help="The host.").tag(config=True, freezable=True)
+    port = Integer(8080, help="The port.").tag(config=True, freezable=True)
+    requests = Integer(0, help="Runtime request counter.")
+
+
+def test_freeze_covers_all_write_paths_and_restores_after_errors():
+    service = FrozenService(config=Config({"FrozenService": {"host": "startup.example.com"}}))
+    assert service.host == "startup.example.com"
+
+    # startup complete: freeze the declared config traits
+    service.freeze()
+    assert service.frozen
+
+    # path 1: attribute assignment
+    with pytest.raises(TraitError, match="frozen"):
+        service.host = "other.example.com"
+    # path 2: set_trait
+    with pytest.raises(TraitError, match="frozen"):
+        service.set_trait("port", 9090)
+    # path 3: config loading
+    with pytest.raises(TraitError, match="frozen"):
+        service.update_config(Config({"FrozenService": {"host": "other.example.com"}}))
+    assert service.host == "startup.example.com"
+    assert service.port == 8080
+
+    # runtime traits without freezable metadata stay writable
+    service.requests += 1
+    assert service.requests == 1
+
+    # nested temporary updates; the inner one raises
+    with pytest.raises(RuntimeError, match="boom"):
+        with service.temporarily_unfrozen():
+            service.host = "maint.example.com"
+            with service.temporarily_unfrozen():
+                service.update_config(Config({"FrozenService": {"port": 9090}}))
+                raise RuntimeError("boom")
+            service.port = 7070  # never reached
+
+    # the freeze permission was accurately restored despite the exception
+    assert service.frozen
+    assert service.host == "maint.example.com"
+    assert service.port == 9090
+    with pytest.raises(TraitError, match="frozen"):
+        service.host = "other.example.com"
+    with pytest.raises(TraitError, match="frozen"):
+        service.update_config(Config({"FrozenService": {"port": 7070}}))
+
+    # validation is not bypassed inside a temporary update
+    with service.temporarily_unfrozen(), pytest.raises(TraitError):
+        service.port = "not-an-int"
+    assert service.port == 9090
+    assert service.frozen

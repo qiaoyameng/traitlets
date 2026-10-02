@@ -3215,3 +3215,134 @@ def test_mock_patch():
     with mock.patch.object(a, "trait", "patch"):
         assert a.trait == "patch"
     assert a.trait == "set"
+
+
+class FreezableService(HasTraits):
+    """A service whose config traits are frozen after startup."""
+
+    host = Unicode("localhost").tag(freezable=True)
+    port = Int(8080).tag(freezable=True)
+    requests = Int(0)  # runtime counter, stays writable
+
+
+class TestFreeze:
+    def test_not_frozen_by_default(self):
+        service = FreezableService()
+        assert not service.frozen
+        service.host = "example.com"
+        assert service.host == "example.com"
+
+    def test_freeze_blocks_attribute_assignment(self):
+        service = FreezableService()
+        service.freeze()
+        assert service.frozen
+        with pytest.raises(TraitError, match="frozen"):
+            service.host = "example.com"
+        assert service.host == "localhost"
+
+    def test_freeze_blocks_set_trait(self):
+        service = FreezableService()
+        service.freeze()
+        with pytest.raises(TraitError, match="frozen"):
+            service.set_trait("port", 9090)
+        assert service.port == 8080
+
+    def test_freeze_keeps_runtime_traits_writable(self):
+        service = FreezableService()
+        service.freeze()
+        service.requests += 1
+        service.set_trait("requests", 10)
+        assert service.requests == 10
+
+    def test_unfreeze(self):
+        service = FreezableService()
+        service.freeze()
+        service.unfreeze()
+        assert not service.frozen
+        service.host = "example.com"
+        assert service.host == "example.com"
+
+    def test_temporarily_unfrozen_restores_state(self):
+        service = FreezableService()
+        service.freeze()
+        with service.temporarily_unfrozen():
+            assert not service.frozen
+            service.host = "example.com"
+        assert service.frozen
+        assert service.host == "example.com"
+        with pytest.raises(TraitError, match="frozen"):
+            service.host = "other.example.com"
+
+    def test_temporarily_unfrozen_nested_with_exception(self):
+        service = FreezableService()
+        service.freeze()
+        with pytest.raises(RuntimeError, match="boom"):
+            with service.temporarily_unfrozen():
+                service.host = "outer.example.com"
+                with service.temporarily_unfrozen():
+                    assert not service.frozen
+                    service.port = 9090
+                    raise RuntimeError("boom")
+                # the innermost exit restored the *outer* unfrozen state
+                assert not service.frozen
+        # the exception propagated through both contexts,
+        # and the original frozen state was restored
+        assert service.frozen
+        assert service.host == "outer.example.com"
+        assert service.port == 9090
+        with pytest.raises(TraitError, match="frozen"):
+            service.port = 7070
+
+    def test_temporarily_unfrozen_on_unfrozen_instance(self):
+        service = FreezableService()
+        with service.temporarily_unfrozen():
+            assert not service.frozen
+        assert not service.frozen
+
+    def test_validation_still_applies_while_unfrozen(self):
+        service = FreezableService()
+        service.freeze()
+        with service.temporarily_unfrozen(), pytest.raises(TraitError):
+            service.port = "not-an-int"
+        assert service.port == 8080
+        assert service.frozen
+
+    def test_dynamic_default_still_materializes_on_read(self):
+        class Dynamic(HasTraits):
+            value = Int().tag(freezable=True)
+
+            @default("value")
+            def _value_default(self):
+                return 41
+
+        obj = Dynamic()
+        obj.freeze()
+        # reading lazily computes and stores the default; this is not a write
+        assert obj.value == 41
+        with pytest.raises(TraitError, match="frozen"):
+            obj.value = 42
+
+    def test_add_traits_after_freeze(self):
+        service = FreezableService()
+        service.freeze()
+        service.add_traits(extra=Int(5).tag(freezable=True), plain=Int(1))
+        # newly added traits are governed by their own freezable metadata
+        with pytest.raises(TraitError, match="frozen"):
+            service.extra = 6
+        service.plain = 2
+        assert service.plain == 2
+        with service.temporarily_unfrozen():
+            service.extra = 6
+        assert service.extra == 6
+
+    def test_freeze_is_shallow(self):
+        class Holder(HasTraits):
+            items = List(Int()).tag(freezable=True)
+
+        holder = Holder(items=[1, 2])
+        holder.freeze()
+        # in-place mutation of the value is not guarded, only assignment is
+        holder.items.append(3)
+        assert holder.items == [1, 2, 3]
+        with pytest.raises(TraitError, match="frozen"):
+            holder.items = [4]

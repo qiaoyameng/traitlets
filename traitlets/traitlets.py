@@ -737,6 +737,10 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
             return self.get(obj, cls)  # type:ignore[return-value]
 
     def set(self, obj: HasTraits, value: S) -> None:
+        if obj._trait_frozen:
+            # Freeze check happens before validation so that frozen traits
+            # are never modified; writable traits are validated as usual.
+            obj._check_trait_frozen(self.name)
         new_value = self._validate(obj, value)
         assert self.name is not None
         try:
@@ -1371,6 +1375,7 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _trait_notifiers: dict[str | Sentinel, t.Any]
     _trait_validators: dict[str | Sentinel, t.Any]
     _cross_validation_lock: bool
+    _trait_frozen: bool
     _traits: dict[str, t.Any]
     _all_trait_default_generators: dict[str, t.Any]
 
@@ -1382,6 +1387,7 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         self._trait_notifiers = {}
         self._trait_validators = {}
         self._cross_validation_lock = False
+        self._trait_frozen = False
         super(HasTraits, self).setup_instance(*args, **kwargs)
 
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
@@ -1554,6 +1560,68 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                 for changes in cache.values():
                     for change in changes:
                         self.notify_change(change)
+
+    @property
+    def frozen(self) -> bool:
+        """Whether this instance currently freezes its freezable traits.
+
+        See :meth:`freeze` for details.
+        """
+        return self._trait_frozen
+
+    def freeze(self) -> None:
+        """Freeze this instance's traits that declare ``freezable=True`` metadata.
+
+        Once frozen, assigning to a freezable trait raises a :exc:`TraitError`.
+        This applies to every write path: regular attribute assignment,
+        :meth:`set_trait`, and loading values from a
+        :class:`~traitlets.config.Config` object. Traits without
+        ``freezable=True`` metadata (e.g. runtime counters) stay writable,
+        and validation of writable traits is unaffected.
+
+        The freeze is intentionally shallow: it only guards assignment of
+        trait attributes on this instance. Mutating a trait's value in place
+        (e.g. appending to a ``List`` trait's value) is not prevented.
+
+        Use :meth:`unfreeze` to lift the freeze permanently, or the
+        :meth:`temporarily_unfrozen` context manager for a scoped update.
+        """
+        self._trait_frozen = True
+
+    def unfreeze(self) -> None:
+        """Lift a freeze previously applied with :meth:`freeze`."""
+        self._trait_frozen = False
+
+    def _check_trait_frozen(self, name: str | None) -> None:
+        """Raise a TraitError if the named trait is frozen on this instance."""
+        if name is None:
+            return
+        trait = self._traits.get(name)
+        if trait is not None and trait.metadata.get("freezable", False):
+            raise TraitError(
+                f'The "{name}" trait of a {self.__class__.__name__} instance is frozen. '
+                "Use the temporarily_unfrozen() context manager to update it, "
+                "or unfreeze() to lift the freeze."
+            )
+
+    @contextlib.contextmanager
+    def temporarily_unfrozen(self) -> t.Any:
+        """A context manager for temporarily lifting a trait freeze.
+
+        Inside the context, freezable traits may be assigned again; all of
+        the usual validation still applies. On exit, the previous freeze
+        state is restored, even if the block raises. The context manager is
+        re-entrant: nested uses restore the outer state correctly.
+
+        Traits added with :meth:`add_traits` while unfrozen are governed by
+        their own ``freezable`` metadata once the freeze is restored.
+        """
+        previous = self._trait_frozen
+        self._trait_frozen = False
+        try:
+            yield self
+        finally:
+            self._trait_frozen = previous
 
     def _notify_trait(self, name: str, old_value: t.Any, new_value: t.Any) -> None:
         self.notify_change(
