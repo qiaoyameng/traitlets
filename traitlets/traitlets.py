@@ -86,6 +86,7 @@ __all__ = [
     "CaselessStrEnum",
     "ClassBasedTraitType",
     "Complex",
+    "Computed",
     "Container",
     "DefaultHandler",
     "Dict",
@@ -124,6 +125,7 @@ __all__ = [
     "default",
     "directional_link",
     "dlink",
+    "computed",
     "link",
     "observe",
     "observe_compat",
@@ -753,6 +755,7 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
         if silent is not True:
             # we explicitly compare silent to True just in case the equality
             # comparison above returns something other than True/False
+            obj._invalidate_computed_traits(self.name)
             obj._notify_trait(self.name, old_value, new_value)
 
     def __set__(self, obj: HasTraits, value: S) -> None:
@@ -1060,6 +1063,8 @@ class MetaHasTraits(MetaHasDescriptors):
         # also looking at base classes
         cls._all_trait_default_generators = {}
         cls._traits = {}
+        cls._computed_dependencies = {}
+        cls._computed_dependents = {}
         cls._static_immutable_initial_values = {}
 
         super().setup_class(classdict)
@@ -1138,6 +1143,60 @@ class MetaHasTraits(MetaHasDescriptors):
                     # we always add it, because a class may change when we call add_trait
                     # and then the instance may not have all the _static_immutable_initial_values
                     cls._all_trait_default_generators[name] = trait.default
+
+        cls._setup_computed_traits()
+
+    def _setup_computed_traits(cls: MetaHasTraits) -> None:
+        computed_traits = {
+            name: trait
+            for name, trait in cls._traits.items()
+            if isinstance(trait, Computed)
+        }
+        dependencies = {
+            name: trait.dependencies for name, trait in computed_traits.items()
+        }
+
+        for name, dep_names in dependencies.items():
+            missing = [dep for dep in dep_names if dep not in cls._traits]
+            if missing:
+                raise TraitError(
+                    f"Computed trait {name!r} depends on undefined trait(s): "
+                    f"{', '.join(repr(name) for name in missing)}."
+                )
+
+        dependents: dict[str, set[str]] = {}
+        for name, dep_names in dependencies.items():
+            for dependency in dep_names:
+                dependents.setdefault(dependency, set()).add(name)
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str, path: list[str]) -> None:
+            if name in visited:
+                return
+            if name in visiting:
+                cycle_start = path.index(name)
+                cycle = path[cycle_start:] + [name]
+                raise TraitError(
+                    "Circular dependency between computed traits: "
+                    + " -> ".join(repr(item) for item in cycle)
+                )
+
+            visiting.add(name)
+            path.append(name)
+            for dependency in dependencies.get(name, ()):
+                if dependency in dependencies:
+                    visit(dependency, path)
+            path.pop()
+            visiting.remove(name)
+            visited.add(name)
+
+        for name in dependencies:
+            visit(name, [])
+
+        cls._computed_dependencies = dependencies
+        cls._computed_dependents = dependents
 
 
 def observe(*names: Sentinel | str, type: str = "change") -> ObserveHandler:
@@ -1335,6 +1394,172 @@ class DefaultHandler(EventHandler):
         cls._trait_default_generators[self.trait_name] = self
 
 
+class Computed(TraitType[t.Any, t.Any]):
+    """A read-only trait computed from explicitly declared traits."""
+
+    read_only = True
+
+    def __init__(
+        self,
+        *args: t.Any,
+        compute: t.Callable[[HasTraits], t.Any] | None = None,
+        dependencies: str | t.Collection[str] | None = None,
+        depends_on: str | t.Collection[str] | None = None,
+        deps: str | t.Collection[str] | None = None,
+        func: t.Callable[[HasTraits], t.Any] | None = None,
+        trait: TraitType[t.Any, t.Any] | None = None,
+        trait_type: TraitType[t.Any, t.Any] | None = None,
+        **kwargs: t.Any,
+    ) -> None:
+        positional_dependencies: list[str] = []
+        for value in args:
+            if isinstance(value, TraitType):
+                trait = value
+            elif callable(value):
+                compute = value
+            elif isinstance(value, str):
+                positional_dependencies.append(value)
+            else:
+                positional_dependencies.extend(value)
+
+        if compute is None:
+            compute = func
+        if trait is None:
+            trait = trait_type
+
+        dependency_arguments = [
+            argument
+            for argument in (dependencies, depends_on, deps)
+            if argument is not None
+        ]
+        if len(dependency_arguments) > 1:
+            raise TypeError(
+                "Specify only one of 'dependencies', 'depends_on', or 'deps'."
+            )
+        dependencies = dependency_arguments[0] if dependency_arguments else None
+
+        if isinstance(dependencies, str):
+            dependency_names = [dependencies]
+        elif dependencies is None:
+            dependency_names = positional_dependencies
+        else:
+            dependency_names = [*dependencies, *positional_dependencies]
+
+        for dependency in dependency_names:
+            if not isinstance(dependency, str):
+                raise TypeError(
+                    f"Computed trait dependencies must be strings, not {dependency!r}"
+                )
+
+        self.trait = trait if trait is not None else Any()
+        self.compute = compute
+        self.dependencies = tuple(dict.fromkeys(dependency_names))
+
+        super().__init__(
+            default_value=Undefined,
+            allow_none=self.trait.allow_none,
+            read_only=True,
+            **kwargs,
+        )
+
+    def class_init(self, cls: type[HasTraits], name: str | None) -> None:
+        self.trait.class_init(cls, name)
+        super().class_init(cls, name)
+
+    def subclass_init(self, cls: type[HasTraits]) -> None:
+        self.trait.subclass_init(cls)
+        # Avoid adding Computed.instance_init in addition to the wrapped
+        # trait's own instance initialization. add_traits calls it directly.
+
+    def instance_init(self, obj: HasTraits) -> None:
+        self.trait.instance_init(obj)
+
+    def validate(self, obj: HasTraits, value: t.Any) -> t.Any:
+        if hasattr(self.trait, "validate"):
+            return self.trait.validate(obj, value)
+        return value
+
+    def info(self) -> str:
+        return self.trait.info()
+
+    def from_string(self, s: str) -> t.Any:
+        return self.trait.from_string(s)
+
+    def __call__(self, compute: t.Callable[[HasTraits], t.Any]) -> Computed:
+        self.compute = compute
+        return self
+
+    def get(self, obj: HasTraits, cls: type[t.Any] | None = None) -> t.Any:
+        assert self.name is not None
+        name = self.name
+
+        if name not in obj._computed_dirty:
+            try:
+                return obj._trait_values[name]
+            except KeyError:
+                pass
+
+        if name in obj._computing_traits:
+            raise TraitError(f"Circular dependency while computing trait {name!r}.")
+
+        compute = self.compute
+        if compute is None:
+            compute = getattr(obj, f"_{name}_compute", None)
+        if not callable(compute):
+            raise TraitError(f"Computed trait {name!r} has no compute function.")
+
+        obj._computing_traits.add(name)
+        try:
+            value = compute() if self.compute is None else compute(obj)
+            value = self._validate(obj, value)
+        finally:
+            obj._computing_traits.remove(name)
+
+        try:
+            old_value = obj._trait_values[name]
+        except KeyError:
+            old_value = Undefined
+
+        obj._trait_values[name] = value
+        obj._computed_dirty.discard(name)
+
+        if old_value is Undefined:
+            obj._notify_observers(
+                Bunch(name=name, value=value, owner=obj, type="default")
+            )
+        else:
+            try:
+                changed = bool(old_value != value)
+            except Exception:
+                changed = True
+            if changed:
+                obj._notify_trait(name, old_value, value)
+
+        return value
+
+    def set(self, obj: HasTraits, value: t.Any) -> t.NoReturn:
+        raise TraitError(f'The "{self.name}" trait is read-only.')
+
+    def __delete__(self, obj: HasTraits) -> None:
+        assert self.name is not None
+        obj._trait_values.pop(self.name, None)
+        obj._computed_dirty.add(self.name)
+
+
+class _ComputedDecorator(BaseDescriptor):
+    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+        self.args = args
+        self.kwargs = kwargs
+
+    def __call__(self, compute: t.Callable[[HasTraits], t.Any]) -> Computed:
+        return Computed(*self.args, compute=compute, **self.kwargs)
+
+
+def computed(*args: t.Any, **kwargs: t.Any) -> _ComputedDecorator:
+    """Declare a read-only computed trait."""
+    return _ComputedDecorator(*args, **kwargs)
+
+
 class HasDescriptors(metaclass=MetaHasDescriptors):
     """The base class for all classes that have descriptors."""
 
@@ -1372,6 +1597,10 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _trait_validators: dict[str | Sentinel, t.Any]
     _cross_validation_lock: bool
     _traits: dict[str, t.Any]
+    _computed_dependencies: dict[str, tuple[str, ...]]
+    _computed_dependents: dict[str, set[str]]
+    _computed_dirty: set[str]
+    _computing_traits: set[str]
     _all_trait_default_generators: dict[str, t.Any]
 
     def setup_instance(self, /, *args: t.Any, **kwargs: t.Any) -> None:
@@ -1381,8 +1610,20 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         self._trait_values = self._static_immutable_initial_values.copy()
         self._trait_notifiers = {}
         self._trait_validators = {}
+        self._computed_dirty = set(self._computed_dependencies)
+        self._computing_traits = set()
         self._cross_validation_lock = False
         super(HasTraits, self).setup_instance(*args, **kwargs)
+
+    def _invalidate_computed_traits(self, name: str) -> None:
+        dependents = type(self)._computed_dependents
+        pending = list(dependents.get(name, ()))
+        while pending:
+            dependency = pending.pop()
+            if dependency in self._computed_dirty:
+                continue
+            self._computed_dirty.add(dependency)
+            pending.extend(dependents.get(dependency, ()))
 
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
         # Allow trait values to be set using keyword arguments.
@@ -1799,6 +2040,8 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
             attrs["__qualname__"] = cls.__qualname__
         attrs.update(traits)
         self.__class__ = type(cls.__name__, (cls,), attrs)
+        self.__class__._setup_computed_traits()
+        self._computed_dirty = set(self.__class__._computed_dependencies)
         for trait in traits.values():
             trait.instance_init(self)
 
