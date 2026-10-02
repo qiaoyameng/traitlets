@@ -138,6 +138,75 @@ value will be ``None``, instead of what we wanted (which is ``proposal['value']`
 However, we recommend that custom cross-validators don't modify the state of
 the HasTraits instance.
 
+Freezing Traits
+^^^^^^^^^^^^^^^
+
+After an object has finished startup, traits that represent configuration can
+be marked with the ``freezable=True`` metadata key and then frozen on the
+instance. Traits without that metadata remain writable, which is useful for
+counters and other runtime state:
+
+.. code:: python
+
+    from traitlets import HasTraits, Int, List, TraitError
+
+
+    class Service(HasTraits):
+        retries = Int(3).tag(freezable=True)
+        request_count = Int(0)
+        endpoints = List().tag(freezable=True)
+
+
+    service = Service()
+    service.freeze()
+
+    service.retries = 5          # raises TraitError
+    service.set_trait("retries", 5)  # also raises TraitError
+    service.request_count += 1   # runtime state remains writable
+
+Freezing is instance-specific. It covers direct attribute assignment,
+:meth:`HasTraits.set_trait`, and configuration loading. A frozen freezable
+trait is rejected before a proposed value can be stored. Allowed updates still
+run the usual trait validation and observers, so a temporarily thawed instance
+can reject an invalid value.
+
+Use :meth:`HasTraits.temporary_trait_updates` for an explicit, nestable
+configuration update block. Each nested block restores the freeze state that
+was in effect when that block started, even if the block raises an exception.
+The context restores permissions only; it does not roll back values that were
+successfully assigned:
+
+.. code:: python
+
+    try:
+        with service.temporary_trait_updates():
+            service.retries = 4
+            with service.temporary_trait_updates():
+                service.retries = 5
+                raise RuntimeError("update failed")
+    except RuntimeError:
+        pass
+
+    # The outer block was temporary, so the instance is frozen again.
+    # service.retries is still 4; successful assignments are not undone.
+
+Traits added with :meth:`HasTraits.add_traits` use their metadata at the time
+of assignment. A freezable trait added while the instance is frozen is frozen
+immediately, while a newly added non-freezable trait is writable.
+
+Freezing does not make values deeply immutable. If a freezable trait refers to
+a mutable value such as a list or dict, replacing the trait value is blocked,
+but in-place operations on that object are not:
+
+.. code:: python
+
+    service.endpoints.append("/health")  # allowed; the object is mutated
+    service.endpoints = ["/health"]      # blocked; the trait is reassigned
+
+If a freezable trait has a dynamic default, reading it after freezing still
+creates and stores that default. Any writes made by the default generator are
+subject to the freeze rules in effect at the time the default is read.
+
 Advanced Example: Validating the Schema
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

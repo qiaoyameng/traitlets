@@ -32,6 +32,7 @@ from traitlets.traitlets import (
     Integer,
     List,
     Set,
+    TraitError,
     Unicode,
     validate,
 )
@@ -77,6 +78,12 @@ class Bar(Foo):
     bset_values = Set([2, 1, 5]).tag(config=True, multiplicity="+")
     bdict = Dict().tag(config=True, multiplicity="+")
     bdict_values = Dict({1: "a", "0": "b", 5: "c"}).tag(config=True, multiplicity="+")
+
+
+class FrozenService(Configurable):
+    a = Integer(0).tag(config=True, freezable=True)
+    b = Unicode("default").tag(config=True, freezable=True)
+    request_count = Integer(0)
 
 
 foo_help = """Foo(Configurable) options
@@ -843,6 +850,60 @@ class TestConfigContainers(TestCase):
         c.MyConfigurable.a = 10
         m.update_config(c)
         self.assertEqual(m.a, 10)
+
+    def test_frozen_config_trait_paths_and_nested_updates(self):
+        service = FrozenService(a=1, b="ready")
+        service.freeze()
+
+        with pytest.raises(TraitError, match="is frozen"):
+            service.a = 2
+        with pytest.raises(TraitError, match="is frozen"):
+            service.set_trait("a", 2)
+
+        config = Config()
+        config.FrozenService.a = 2
+        config.FrozenService.b = "reloaded"
+        with pytest.raises(TraitError, match="is frozen"):
+            service.update_config(config)
+        self.assertEqual(service.a, 1)
+        self.assertEqual(service.b, "ready")
+
+        service.request_count = 1
+        with pytest.raises(RuntimeError):
+            with service.temporary_trait_updates():
+                service.a = 3
+                try:
+                    with service.temporary_trait_updates():
+                        service.a = 4
+                        config.FrozenService.a = 5
+                        service.update_config(config)
+                        raise RuntimeError("configuration rollback")
+                except RuntimeError:
+                    self.assertFalse(service.is_frozen())
+                    service.a = 6
+                    raise
+
+        self.assertTrue(service.is_frozen())
+        self.assertEqual(service.a, 6)
+        self.assertEqual(service.b, "reloaded")
+        self.assertEqual(service.request_count, 1)
+        with pytest.raises(TraitError, match="is frozen"):
+            service.a = 7
+
+        with service.temporary_trait_updates():
+            config.FrozenService.a = "invalid"
+            with pytest.raises(TraitError, match="expected an int"):
+                service.update_config(config)
+            self.assertEqual(service.a, 6)
+
+            config.FrozenService.a = 8
+            service.update_config(config)
+
+        self.assertTrue(service.is_frozen())
+        self.assertEqual(service.a, 8)
+        self.assertEqual(service.b, "reloaded")
+        with pytest.raises(TraitError, match="is frozen"):
+            service.a = 9
 
     def test_config_default(self):
         class SomeSingleton(SingletonConfigurable):

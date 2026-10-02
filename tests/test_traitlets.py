@@ -837,6 +837,91 @@ class TestObserveDecorator(TestCase):
 
 
 class TestHasTraits(TestCase):
+    def test_freezable_traits(self):
+        class Freezable(HasTraits):
+            value = Int().tag(freezable=True)
+            counter = Int()
+            items = List().tag(freezable=True)
+
+            @default("value")
+            def _value_default(self):
+                self.counter += 1
+                return self.counter
+
+        obj = Freezable()
+        obj.freeze()
+
+        self.assertEqual(obj.value, 1)
+        with pytest.raises(TraitError, match="is frozen"):
+            obj.value = 2
+        with pytest.raises(TraitError, match="is frozen"):
+            obj.set_trait("value", 2)
+
+        obj.counter = 3
+        obj.items.append(1)
+        self.assertEqual(obj.counter, 3)
+        self.assertEqual(obj.items, [1])
+
+        obj.add_traits(
+            later=Int().tag(freezable=True),
+            runtime=Int(),
+        )
+        with pytest.raises(TraitError, match="is frozen"):
+            obj.later = 1
+        obj.runtime = 1
+
+        class UnionFreezable(HasTraits):
+            value = Union([Int().tag(freezable=True), Unicode().tag(freezable=True)])
+
+        union_obj = UnionFreezable()
+        union_obj.value = 1
+        union_obj.freeze()
+        with pytest.raises(TraitError, match="is frozen"):
+            union_obj.value = "one"
+
+        with obj.temporary_trait_updates():
+            with pytest.raises(TraitError, match="expected an int"):
+                obj.value = "invalid"
+            obj.value = 4
+            with pytest.raises(RuntimeError):
+                with obj.temporary_trait_updates():
+                    obj.value = 5
+                    raise RuntimeError("nested failure")
+            obj.value = 6
+
+        self.assertEqual(obj.value, 6)
+        self.assertTrue(obj.is_frozen())
+        with pytest.raises(TraitError, match="is frozen"):
+            obj.value = 7
+
+        obj.unfreeze()
+        obj.value = 8
+        self.assertEqual(obj.value, 8)
+
+    def test_frozen_rollback_during_notification_validation(self):
+        class Freezable(HasTraits):
+            value = Int(1).tag(freezable=True)
+            other = Int(1)
+
+            @validate("value")
+            def _validate_value(self, proposal):
+                if proposal.value != self.other:
+                    raise TraitError("values must match")
+                return proposal.value
+
+        obj = Freezable()
+        obj.freeze()
+
+        with pytest.raises(TraitError, match="values must match"):
+            with obj.hold_trait_notifications():
+                with obj.temporary_trait_updates():
+                    obj.value = 2
+
+        self.assertTrue(obj.is_frozen())
+        self.assertEqual(obj.value, 1)
+        with pytest.raises(TraitError, match="is frozen"):
+            obj.value = 2
+
     def test_trait_names(self):
         class A(HasTraits):
             i = Int()

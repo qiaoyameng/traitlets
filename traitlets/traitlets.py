@@ -737,6 +737,8 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
             return self.get(obj, cls)  # type:ignore[return-value]
 
     def set(self, obj: HasTraits, value: S) -> None:
+        if obj._is_trait_frozen(self.name):
+            raise TraitError(f'The "{self.name}" trait is frozen.')
         new_value = self._validate(obj, value)
         assert self.name is not None
         try:
@@ -1371,6 +1373,8 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _trait_notifiers: dict[str | Sentinel, t.Any]
     _trait_validators: dict[str | Sentinel, t.Any]
     _cross_validation_lock: bool
+    _traits_frozen: bool
+    _frozen_trait_update_override: str | None
     _traits: dict[str, t.Any]
     _all_trait_default_generators: dict[str, t.Any]
 
@@ -1382,6 +1386,8 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         self._trait_notifiers = {}
         self._trait_validators = {}
         self._cross_validation_lock = False
+        self._traits_frozen = False
+        self._frozen_trait_update_override = None
         super(HasTraits, self).setup_instance(*args, **kwargs)
 
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
@@ -1539,10 +1545,11 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                     for change in changes[::-1]:
                         # TODO: Separate in a rollback function per notification type.
                         if change.type == "change":
-                            if change.old is not Undefined:
-                                self.set_trait(name, change.old)
-                            else:
-                                self._trait_values.pop(name)
+                            with self._allow_frozen_trait_update(name):
+                                if change.old is not Undefined:
+                                    self.set_trait(name, change.old)
+                                else:
+                                    self._trait_values.pop(name)
                 cache = {}
                 raise
             finally:
@@ -1801,6 +1808,58 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         self.__class__ = type(cls.__name__, (cls,), attrs)
         for trait in traits.values():
             trait.instance_init(self)
+
+    def freeze(self) -> None:
+        """Freeze every trait marked with ``freezable=True`` metadata."""
+        self._traits_frozen = True
+
+    def unfreeze(self) -> None:
+        """Allow traits marked with ``freezable=True`` metadata to be updated."""
+        self._traits_frozen = False
+
+    def is_frozen(self) -> bool:
+        """Return whether freezable traits are currently frozen."""
+        return self._traits_frozen
+
+    @contextlib.contextmanager
+    def temporary_trait_updates(self) -> t.Iterator[None]:
+        """Temporarily allow updates to traits while this instance is frozen.
+
+        The freeze state in effect when the context is entered is restored
+        when it exits, including when an exception is raised. Nested contexts
+        restore only their own frame, so the outer context determines the
+        final state.
+        """
+        was_frozen = self._traits_frozen
+        self._traits_frozen = False
+        try:
+            yield
+        finally:
+            self._traits_frozen = was_frozen
+
+    def _trait_can_freeze(self, name: str) -> bool:
+        trait = self._traits.get(name)
+        if trait is None:
+            return False
+        metadata_name = "_" + name + "_metadata"
+        metadata = getattr(self, metadata_name, trait.metadata)
+        return bool(metadata.get("freezable", trait.metadata.get("freezable", False)))
+
+    def _is_trait_frozen(self, name: str) -> bool:
+        return (
+            self._traits_frozen
+            and self._frozen_trait_update_override != name
+            and self._trait_can_freeze(name)
+        )
+
+    @contextlib.contextmanager
+    def _allow_frozen_trait_update(self, name: str) -> t.Iterator[None]:
+        previous_name = self._frozen_trait_update_override
+        self._frozen_trait_update_override = name
+        try:
+            yield
+        finally:
+            self._frozen_trait_update_override = previous_name
 
     def set_trait(self, name: str, value: t.Any) -> None:
         """Forcibly sets trait attribute, including read-only attributes."""
