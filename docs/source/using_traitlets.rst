@@ -198,6 +198,26 @@ external validator:
     s.value = dict(name="", price="1")  # raises a TraitError
 
 
+Validating Candidate Changes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``validate_changes`` to check a group of proposed values before applying
+them. The result contains normalized candidate values and a mapping of
+per-field errors. Cross-validators see candidate values for fields included in
+the group and current values for fields that are not included. Dynamic
+defaults needed by validation are calculated in temporary state, no change
+notifications are emitted, and validators that modify traits receive a
+``TraitError``.
+
+.. code:: python
+
+    candidates, errors = panel.validate_changes(start=2, end=5)
+    if not errors:
+        with panel.hold_trait_notifications():
+            for name, value in candidates.items():
+                panel.set_trait(name, value)
+
+
 Holding Trait Cross-Validation and Notifications
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

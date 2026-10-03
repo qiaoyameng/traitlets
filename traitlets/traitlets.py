@@ -42,6 +42,8 @@ Inheritance diagram:
 from __future__ import annotations
 
 import contextlib
+from collections import namedtuple
+from collections.abc import Mapping
 import enum
 import numbers
 import os
@@ -1335,6 +1337,198 @@ class DefaultHandler(EventHandler):
         cls._trait_default_generators[self.trait_name] = self
 
 
+_ValidationChangesResult = namedtuple("_ValidationChangesResult", ("candidates", "errors"))
+
+
+class _ValidateChangesResult(_ValidationChangesResult):
+    @property
+    def values(self) -> dict[str, t.Any]:
+        return self.candidates
+
+    @property
+    def changes(self) -> dict[str, t.Any]:
+        return self.candidates
+
+    @property
+    def candidate_values(self) -> dict[str, t.Any]:
+        return self.candidates
+
+    @property
+    def field_errors(self) -> dict[str, Exception]:
+        return self.errors
+
+    def __getitem__(self, key: t.Any) -> t.Any:
+        if key in ("candidates", "candidate_values", "values", "changes"):
+            return self.candidates
+        if key in ("errors", "field_errors"):
+            return self.errors
+        return super().__getitem__(key)
+
+
+class _ValidationCandidateValues(Mapping):
+    def __init__(
+        self,
+        candidate: _ValidationCandidate,
+        owner: HasTraits,
+        candidates: dict[str, t.Any],
+    ) -> None:
+        self._candidate = candidate
+        self._owner = owner
+        self._candidate_values = candidates
+        self._current_values = owner._trait_values.copy()
+        self._default_values: dict[str, t.Any] = {}
+        self._temporary_values: dict[str, t.Any] = {}
+
+    def __getitem__(self, name: str) -> t.Any:
+        if name in self._temporary_values:
+            return self._temporary_values[name]
+        if name in self._default_values:
+            return self._default_values[name]
+        if name in self._candidate_values:
+            return self._candidate_values[name]
+        if name in self._current_values and self._current_values[name] is not _DELETED:
+            return self._current_values[name]
+
+        trait = self._owner._traits.get(name)
+        if trait is None:
+            raise KeyError(name)
+
+        with self._candidate._allow_mutation():
+            default = self._owner._get_trait_default_generator(name)(self._candidate)
+        value = trait._validate(self._candidate, default)
+        self._default_values[name] = value
+        return value
+
+    def __iter__(self) -> t.Iterator[str]:
+        names = (
+            set(self._current_values)
+            | set(self._candidate_values)
+            | set(self._default_values)
+            | set(self._temporary_values)
+        )
+        return iter(names)
+
+    def __len__(self) -> int:
+        names = (
+            set(self._current_values)
+            | set(self._candidate_values)
+            | set(self._default_values)
+            | set(self._temporary_values)
+        )
+        return len(names)
+
+    def __setitem__(self, name: str, value: t.Any) -> None:
+        if object.__getattribute__(self._candidate, "_allow_trait_mutation"):
+            self._temporary_values[name] = value
+            return
+        raise TraitError("Cannot modify trait values while validating candidate changes")
+
+
+class _ValidationCandidate:
+    __slots__ = ("_owner", "_trait_values", "_allow_trait_mutation", "__dict__")
+
+    _cross_validation_lock = True
+
+    @property
+    def __class__(self) -> type[t.Any]:  # type:ignore[override]
+        return type(object.__getattribute__(self, "_owner"))
+
+    def __init__(self, owner: HasTraits, candidates: dict[str, t.Any]) -> None:
+        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(
+            self, "_trait_values", _ValidationCandidateValues(self, owner, candidates)
+        )
+        object.__setattr__(self, "_allow_trait_mutation", False)
+
+    @contextlib.contextmanager
+    def _allow_mutation(self) -> t.Iterator[None]:
+        previous = object.__getattribute__(self, "_allow_trait_mutation")
+        object.__setattr__(self, "_allow_trait_mutation", True)
+        try:
+            yield
+        finally:
+            object.__setattr__(self, "_allow_trait_mutation", previous)
+
+    def __getattr__(self, name: str) -> t.Any:
+        owner = object.__getattribute__(self, "_owner")
+
+        if name in owner._traits:
+            if owner._trait_values.get(name) is _DELETED:
+                raise AttributeError(name)
+            return self._trait_values[name]
+
+        class_attribute = None
+        data_descriptor = False
+        for cls in type(owner).__mro__:
+            if name in cls.__dict__:
+                class_attribute = cls.__dict__[name]
+                data_descriptor = hasattr(class_attribute, "__set__") or hasattr(
+                    class_attribute, "__delete__"
+                )
+                break
+
+        if data_descriptor:
+            return class_attribute.__get__(self, type(owner))
+        if name in owner.__dict__:
+            return owner.__dict__[name]
+        if class_attribute is not None:
+            if hasattr(class_attribute, "__get__"):
+                return class_attribute.__get__(self, type(owner))
+            return class_attribute
+        try:
+            return owner.__dict__[name]
+        except KeyError:
+            return getattr(owner, name)
+
+    def __setattr__(self, name: str, value: t.Any) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        if owner.has_trait(name):
+            if not object.__getattribute__(self, "_allow_trait_mutation"):
+                raise TraitError(
+                    f"Cannot modify the {name!r} trait while validating candidate changes"
+                )
+            self._trait_values[name] = value
+        else:
+            object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        owner = object.__getattribute__(self, "_owner")
+        allow_mutation = object.__getattribute__(self, "_allow_trait_mutation")
+        if owner.has_trait(name) and not allow_mutation:
+            raise TraitError(
+                f"Cannot delete the {name!r} trait while validating candidate changes"
+            )
+        object.__delattr__(self, name)
+
+    def set_trait(self, name: str, value: t.Any) -> None:
+        allow_mutation = object.__getattribute__(self, "_allow_trait_mutation")
+        if not allow_mutation:
+            raise TraitError(
+                f"Cannot modify the {name!r} trait while validating candidate changes"
+            )
+        self._trait_values[name] = value
+
+    def notify_change(self, change: Bunch) -> None:
+        pass
+
+    def _notify_observers(self, event: Bunch) -> None:
+        pass
+
+
+def _rewrite_validation_error(
+    error: Exception, candidate: t.Any, owner: HasTraits
+) -> Exception:
+    if not isinstance(error, TraitError):
+        error = TraitError(str(error))
+    candidate_class = class_of(candidate)
+    owner_class = class_of(owner)
+    error.args = tuple(
+        str(arg).replace(candidate_class, owner_class) if isinstance(arg, str) else arg
+        for arg in error.args
+    )
+    return error
+
+
 class HasDescriptors(metaclass=MetaHasDescriptors):
     """The base class for all classes that have descriptors."""
 
@@ -1801,6 +1995,49 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         self.__class__ = type(cls.__name__, (cls,), attrs)
         for trait in traits.values():
             trait.instance_init(self)
+
+    def validate_changes(
+        self,
+        changes: dict[str, t.Any] | None = None,
+        **keyword_changes: t.Any,
+    ) -> _ValidationChangesResult:
+        """Validate proposed changes without applying them to this object.
+
+        Returns normalized candidate values and a mapping of field errors.
+        """
+        proposed_changes = dict(changes or {})
+        proposed_changes.update(keyword_changes)
+
+        normalized_values: dict[str, t.Any] = {}
+        errors: dict[str, Exception] = {}
+        candidate = _ValidationCandidate(self, normalized_values)
+
+        for name, value in proposed_changes.items():
+            trait = self._traits.get(name)
+            if trait is None:
+                errors[name] = TraitError(
+                    f"Class {self.__class__.__name__} does not have a trait named {name}"
+                )
+                continue
+            if trait.read_only:
+                errors[name] = TraitError(f'The "{name}" trait is read-only.')
+                continue
+            try:
+                normalized_values[name] = trait._validate(candidate, value)
+            except Exception as error:
+                errors[name] = _rewrite_validation_error(error, candidate, self)
+
+        for name in list(normalized_values):
+            trait = self._traits[name]
+            try:
+                normalized_values[name] = trait._cross_validate(
+                    candidate, normalized_values[name]
+                )
+            except Exception as error:
+                errors[name] = _rewrite_validation_error(error, candidate, self)
+                normalized_values.pop(name, None)
+
+        return _ValidateChangesResult(normalized_values, errors)
 
     def set_trait(self, name: str, value: t.Any) -> None:
         """Forcibly sets trait attribute, including read-only attributes."""

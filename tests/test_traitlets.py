@@ -2430,6 +2430,105 @@ def test_cache_modification():
     CacheModification(bar=1)
 
 
+def test_validate_changes_without_committing():
+    default_calls = [0]
+
+    class IntervalPanel(HasTraits):
+        start = CInt(0)
+        end = CInt(10)
+        generated = Int()
+
+        changes = List()
+
+        @default("generated")
+        def _generated_default(self):
+            default_calls[0] += 1
+            return self.start * 2
+
+        @validate("start", "end")
+        def _validate_interval(self, proposal):
+            value = proposal.value
+            if proposal.trait.name == "start":
+                valid = value < self.end and self.generated == value * 2
+            else:
+                valid = self.start < value and self.generated == self.start * 2
+            if not valid:
+                raise TraitError("end must be greater than start")
+            return value
+
+        @observe("start", "end", "generated")
+        def _record_change(self, change):
+            self.changes.append(change)
+
+    panel = IntervalPanel()
+    before_values = (panel.start, panel.end)
+    before_cache = panel._trait_values.copy()
+
+    candidates, errors = panel.validate_changes(start="2", end="5")
+
+    assert candidates == {"start": 2, "end": 5}
+    assert errors == {}
+    assert (panel.start, panel.end) == before_values
+    assert panel._trait_values == before_cache
+    assert "generated" not in panel._trait_values
+    assert default_calls[0] == 1
+    assert panel.changes == []
+
+    with panel.hold_trait_notifications():
+        panel.start = 2
+        panel.end = 5
+
+    assert panel.start == 2
+    assert panel.end == 5
+    assert [change.name for change in panel.changes] == ["start", "end"]
+
+
+def test_validate_changes_collects_field_errors():
+    class Panel(HasTraits):
+        start = CInt(0)
+        end = CInt(10)
+        locked = Int(1, read_only=True)
+
+        @validate("start", "end")
+        def _validate_interval(self, proposal):
+            other = self.end if proposal.trait.name == "start" else self.start
+            if proposal.value >= other:
+                raise TraitError("end must be greater than start")
+            return proposal.value
+
+    panel = Panel()
+    candidates, errors = panel.validate_changes(
+        {"start": "bad", "end": "also bad", "locked": 2, "unknown": 3}
+    )
+
+    assert candidates == {}
+    assert set(errors) == {"start", "end", "locked", "unknown"}
+    assert all(isinstance(error, TraitError) for error in errors.values())
+
+    candidates, errors = panel.validate_changes({"start": 5, "end": 2})
+    assert candidates == {}
+    assert set(errors) == {"start", "end"}
+
+
+def test_validate_changes_rejects_validator_mutation():
+    class Panel(HasTraits):
+        start = CInt(0)
+        end = CInt(10)
+
+        @validate("start")
+        def _validate_start(self, proposal):
+            self.end = proposal.value
+            return proposal.value
+
+    panel = Panel()
+    candidates, errors = panel.validate_changes(start=2)
+
+    assert candidates == {}
+    assert set(errors) == {"start"}
+    assert panel.start == 0
+    assert panel.end == 10
+
+
 class OrderTraits(HasTraits):
     notified = Dict()
 
