@@ -39,6 +39,35 @@ class ArgumentError(ConfigLoaderError):
 
 
 # -----------------------------------------------------------------------------
+# Config provenance (source tracking)
+# -----------------------------------------------------------------------------
+
+#: Source label used for values that came from the command line.
+COMMAND_LINE_SOURCE = "command-line"
+
+#: Source label used for config objects with no recorded source,
+#: e.g. a plain :class:`Config` constructed by user code.
+UNKNOWN_SOURCE = "unknown"
+
+#: Source label used when a value comes from the trait default
+#: (i.e. no config source provided it).
+DEFAULT_SOURCE = "default"
+
+
+class ConfigSourceRecord(t.NamedTuple):
+    """A single record of where a config value came from.
+
+    Only a human-readable source label (e.g. a file name or
+    ``"command-line"``) and the operation applied (``set``, ``append``,
+    ``prepend``, ``insert``, ``update``) are recorded.  Values are never
+    stored, so secrets cannot leak into provenance data.
+    """
+
+    source: str
+    operation: str = "set"
+
+
+# -----------------------------------------------------------------------------
 # Argparse fix
 # -----------------------------------------------------------------------------
 
@@ -203,6 +232,22 @@ class LazyConfigValue(HasTraits):
             d["inserts"] = self._inserts
         return d
 
+    def _provenance_operations(self) -> list[str]:
+        """Operations applied to this value, in application order.
+
+        Used for config provenance tracking.
+        """
+        ops = []
+        if self._inserts:
+            ops.append("insert")
+        if self._prepend:
+            ops.append("prepend")
+        if self._extend:
+            ops.append("append")
+        if self._update:
+            ops.append("update")
+        return ops
+
     def __repr__(self) -> str:
         if self._value is not None:
             return f"<{self.__class__.__name__} value={self._value!r}>"
@@ -213,6 +258,17 @@ class LazyConfigValue(HasTraits):
 def _is_section_key(key: str) -> bool:
     """Is a Config key a section name (does it start with a capital)?"""
     return bool(key and key[0].upper() == key[0] and not key.startswith("_"))
+
+
+def _value_operations(value: t.Any) -> list[str]:
+    """The provenance operations describing a config value.
+
+    Lazy values report each of their append/prepend/insert/update
+    operations; anything else is a plain "set".
+    """
+    if isinstance(value, LazyConfigValue):
+        return value._provenance_operations() or ["set"]
+    return ["set"]
 
 
 class Config(dict):  # type:ignore[type-arg]
@@ -227,11 +283,72 @@ class Config(dict):  # type:ignore[type-arg]
         c.Class.int_trait = 5
         c.Class.list_trait.append("x")
 
+    Config objects also carry optional *provenance* information: a source
+    label (e.g. the file a config was loaded from) and, for each key, the
+    ordered chain of :class:`ConfigSourceRecord` describing who set or
+    modified the value.  Only readable labels and operations are recorded,
+    never values.  Use :meth:`sources_for` to inspect the recorded chain.
     """
 
     def __init__(self, *args: t.Any, **kwds: t.Any) -> None:
         dict.__init__(self, *args, **kwds)
+        # Provenance is stored as instance attributes (not dict items),
+        # so it never shows up in the config data itself.
+        object.__setattr__(self, "_source_label", None)
+        object.__setattr__(self, "_provenance", {})
         self._ensure_subconfig()
+
+    def _effective_source(self) -> str:
+        """The source label for this config, or ``UNKNOWN_SOURCE``."""
+        return self._source_label or UNKNOWN_SOURCE
+
+    def _set_source(self, source: str) -> None:
+        """Tag this config (and any untagged sub-configs) with a source label.
+
+        Labels already present are kept, so configs merged in from other
+        sources retain their own recorded source.
+        """
+        if self._source_label is None:
+            object.__setattr__(self, "_source_label", source)
+        for value in self.values():
+            if isinstance(value, Config):
+                value._set_source(source)
+
+    def _record_source(self, key: str, source: str, operation: str = "set") -> None:
+        """Append a provenance record for a key."""
+        self._provenance.setdefault(key, []).append(ConfigSourceRecord(source, operation))
+
+    def sources_for(self, key: str) -> list[ConfigSourceRecord]:
+        """Return the recorded source chain for a (possibly dotted) key.
+
+        The chain is ordered from lowest to highest priority: the last
+        record describes who provided the final value.  An empty list
+        means the key is not present in this config.  Keys set on a
+        config without any recorded source are reported with the
+        ``UNKNOWN_SOURCE`` label.
+        """
+        if "." in key:
+            first, remainder = key.split(".", 1)
+            try:
+                sub = dict.__getitem__(self, first)
+            except KeyError:
+                return []
+            if isinstance(sub, Config):
+                return sub.sources_for(remainder)
+            return []
+        records = self._provenance.get(key)
+        if records:
+            return list(records)
+        # nothing recorded: synthesize a record from this config's own label
+        try:
+            value = dict.__getitem__(self, key)
+        except KeyError:
+            return []
+        if isinstance(value, Config):
+            return []
+        return [
+            ConfigSourceRecord(self._effective_source(), op) for op in _value_operations(value)
+        ]
 
     def _ensure_subconfig(self) -> None:
         """ensure that sub-dicts that should be Config objects are
@@ -257,9 +374,27 @@ class Config(dict):  # type:ignore[type-arg]
         self.merge(other)
 
     def merge(self, other: t.Any) -> None:
-        """merge another config object into this one"""
+        """merge another config object into this one
+
+        Provenance is recorded for every merged key: each key gains the
+        source records carried by ``other`` (or records synthesized from
+        ``other``'s own source label), appended after any records already
+        present, so the chain reflects who overrode or extended what.
+        """
         to_update = {}
+        other_source = other._effective_source() if isinstance(other, Config) else UNKNOWN_SOURCE
+        other_provenance = getattr(other, "_provenance", None) or {}
         for k, v in other.items():
+            if isinstance(v, Config) and v._source_label is None:
+                # sub-configs inherit the source of the config they came from
+                object.__setattr__(v, "_source_label", other_source)
+            if k in self and k not in self._provenance:
+                # the existing value is about to be overridden or extended:
+                # record where it came from if that was never recorded
+                existing = dict.__getitem__(self, k)
+                if not isinstance(existing, Config):
+                    for op in _value_operations(existing):
+                        self._record_source(k, self._effective_source(), op)
             if k not in self:
                 to_update[k] = v
             else:  # I have this key
@@ -271,6 +406,12 @@ class Config(dict):  # type:ignore[type-arg]
                 else:
                     # Plain updates for non-Configs
                     to_update[k] = v
+            # record provenance for this key
+            if k in other_provenance:
+                self._provenance.setdefault(k, []).extend(other_provenance[k])
+            else:
+                for op in _value_operations(v):
+                    self._record_source(k, other_source, op)
 
         self.update(to_update)
 
@@ -318,13 +459,20 @@ class Config(dict):  # type:ignore[type-arg]
         return _is_section_key(key) and key in self
 
     def copy(self) -> dict[str, t.Any]:
-        return type(self)(dict.copy(self))
+        new_config = type(self)(dict.copy(self))
+        object.__setattr__(new_config, "_source_label", self._source_label)
+        object.__setattr__(
+            new_config, "_provenance", {k: list(v) for k, v in self._provenance.items()}
+        )
+        return new_config
 
     def __copy__(self) -> dict[str, t.Any]:
         return self.copy()
 
     def __deepcopy__(self, memo: t.Any) -> Config:
         new_config = type(self)()
+        object.__setattr__(new_config, "_source_label", self._source_label)
+        object.__setattr__(new_config, "_provenance", copy.deepcopy(self._provenance, memo))
         for key, value in self.items():
             if isinstance(value, (Config, LazyConfigValue)):
                 # deep copy config objects
@@ -558,6 +706,10 @@ class FileConfigLoader(ConfigLoader):
         """Try to find the file by searching the paths."""
         self.full_filename = filefind(self.filename, self.path)
 
+    def _tag_config_source(self) -> None:
+        """Record this file as the provenance source of the loaded config."""
+        self.config._set_source(f"file:{self.full_filename}")
+
 
 class JSONFileConfigLoader(FileConfigLoader):
     """A JSON file loader for config
@@ -580,6 +732,7 @@ class JSONFileConfigLoader(FileConfigLoader):
             raise ConfigFileNotFound(str(e)) from e
         dct = self._read_file_as_dict()
         self.config = self._convert_to_config(dct)
+        self._tag_config_source()
         return self.config
 
     def _read_file_as_dict(self) -> dict[str, t.Any]:
@@ -633,6 +786,7 @@ class PyFileConfigLoader(FileConfigLoader):
         except OSError as e:
             raise ConfigFileNotFound(str(e)) from e
         self._read_file_as_dict()
+        self._tag_config_source()
         return self.config
 
     def load_subconfig(self, fname: str, path: str | None = None) -> None:
@@ -970,6 +1124,7 @@ class ArgParseConfigLoader(CommandLineConfigLoader):
             for p in path:
                 section = section[p]
             setattr(section, key, v)
+        self.config._set_source(COMMAND_LINE_SOURCE)
 
 
 class _FlagAction(argparse.Action):
@@ -1121,6 +1276,7 @@ class KVArgParseConfigLoader(ArgParseConfigLoader):
 
         for subc in self.parsed_data._flags:
             self._load_flag(subc)
+        self.config._set_source(COMMAND_LINE_SOURCE)
 
     def _handle_unrecognized_alias(self, arg: str) -> None:
         """Handling for unrecognized alias arguments

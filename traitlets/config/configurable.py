@@ -28,7 +28,14 @@ from traitlets.utils import warnings
 from traitlets.utils.bunch import Bunch
 from traitlets.utils.text import indent, wrap_paragraphs
 
-from .loader import Config, DeferredConfig, LazyConfigValue, _is_section_key
+from .loader import (
+    DEFAULT_SOURCE,
+    Config,
+    ConfigSourceRecord,
+    DeferredConfig,
+    LazyConfigValue,
+    _is_section_key,
+)
 
 if t.TYPE_CHECKING:
     from typing_extensions import Self
@@ -255,6 +262,39 @@ class Configurable(HasTraits):
         self.config.merge(config)
         # TODO: trigger change event if/when dict-update change events take place
         # DO NOT trigger full trait-change
+
+    def explain_config(self) -> dict[str, list[ConfigSourceRecord]]:
+        """Explain where each configured value came from.
+
+        Returns a dict mapping config trait names to the ordered chain of
+        :class:`~traitlets.config.loader.ConfigSourceRecord` (lowest to
+        highest priority) recorded while loading and merging the config.
+        The final value comes from the last record's source, or from the
+        trait default if the chain is empty.
+
+        This only inspects provenance recorded on the :class:`Config`
+        object itself; it never re-reads or re-executes config files, and
+        only source labels and operations are reported, never values.
+        """
+        my_config = self._find_my_config(self.config)
+        explained = {}
+        for name in my_config:
+            if _is_section_key(name):
+                continue
+            explained[name] = my_config.sources_for(name)
+        return explained
+
+    def config_source(self, name: str) -> str:
+        """Return the label of the source that provided the final value of a trait.
+
+        Returns ``"default"`` if the value comes from the trait default
+        (i.e. no config source provided it), and ``"unknown"`` if it came
+        from a config object with no recorded source.
+        """
+        records = self.explain_config().get(name) or []
+        if not records:
+            return DEFAULT_SOURCE
+        return records[-1].source
 
     @classmethod
     def class_get_help(cls, inst: HasTraits | None = None) -> str:
