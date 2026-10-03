@@ -108,6 +108,8 @@ __all__ = [
     "MetaHasTraits",
     "ObjectName",
     "ObserveHandler",
+    "ObservableDict",
+    "ObservableList",
     "Path",
     "Set",
     "TCPAddress",
@@ -1498,6 +1500,16 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         Use this when doing multiple trait assignments (init, config), to avoid
         race conditions in trait notifiers requesting other trait values.
         All trait notifications will fire after all values have been assigned.
+
+        Notes
+        -----
+        Plain ``change`` notifications for the same trait are merged by
+        keeping only the latest value. In-place mutation events emitted by
+        observable containers (see :class:`ObservableList` and
+        :class:`ObservableDict`) are *not* merged this way: each mutation
+        event carries its own ``operation`` and affected position, so they
+        are queued individually and delivered in order of occurrence when
+        the context exits.
         """
         if self._cross_validation_lock:
             yield
@@ -1510,7 +1522,12 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                 if past_changes is None:
                     return [change]
                 else:
-                    if past_changes[-1]["type"] == "change" and change.type == "change":
+                    if (
+                        past_changes[-1]["type"] == "change"
+                        and change.type == "change"
+                        and "operation" not in past_changes[-1]
+                        and "operation" not in change
+                    ):
                         past_changes[-1]["new"] = change.new
                     else:
                         # In case of changes other than 'change', append the notification.
@@ -4149,6 +4166,368 @@ class Dict(Instance["dict[K, V]"]):
         if value_trait:
             value = value_trait.from_string(value)
         return {key: value}  # type:ignore[dict-item]
+
+
+class _ObservableList(list):  # type:ignore[type-arg]
+    """A ``list`` subclass that validates in-place mutations and notifies its owner.
+
+    Instances of this class are created and managed by :class:`ObservableList`
+    traits; it is not meant to be instantiated directly.
+
+    The container is *not* recursively observable: only mutations of the
+    outermost container assigned to an :class:`ObservableList` trait emit
+    notifications. Nested containers (e.g. the elements of
+    ``ObservableList(ObservableList(Int()))``) are still validated on
+    mutation, but do not emit notifications themselves.
+
+    When the same container is assigned to another instance's trait, it is
+    *re-bound* to the new owner: subsequent mutation notifications are only
+    sent to the new owner, never to the previous one. Copy the container
+    (``list(value)``) first if both owners should keep independent values.
+    """
+
+    _owner: HasTraits | None = None
+    _trait: ObservableList | None = None
+
+    def _bind(self, owner: HasTraits, trait: ObservableList) -> Self:
+        """Attach this container to an owner, detaching it from any previous one."""
+        self._owner = owner
+        self._trait = trait
+        return self
+
+    def _validate_element(self, value: t.Any) -> t.Any:
+        if self._owner is None or self._trait is None:
+            return value
+        return self._trait._validate_element(self._owner, value)
+
+    def _validate_length(self, length: int) -> None:
+        if self._owner is not None and self._trait is not None:
+            self._trait._validate_length(self._owner, length)
+
+    def _notify(self, operation: str, old: list[t.Any], index: t.Any = None) -> None:
+        owner, trait = self._owner, self._trait
+        if owner is None or trait is None or trait.name is None:
+            return
+        owner.notify_change(
+            Bunch(
+                name=trait.name,
+                owner=owner,
+                type="change",
+                old=old,
+                new=self,
+                operation=operation,
+                index=index,
+            )
+        )
+
+    def append(self, value: t.Any) -> None:
+        value = self._validate_element(value)
+        self._validate_length(len(self) + 1)
+        old = list(self)
+        super().append(value)
+        self._notify("append", old, len(self) - 1)
+
+    def extend(self, values: t.Iterable[t.Any]) -> None:
+        # validate every element before mutating, so a failure midway
+        # through the batch leaves the container untouched
+        values = [self._validate_element(v) for v in values]
+        self._validate_length(len(self) + len(values))
+        old = list(self)
+        start = len(self)
+        super().extend(values)
+        self._notify("extend", old, slice(start, len(self)))
+
+    def insert(self, index: int, value: t.Any) -> None:
+        value = self._validate_element(value)
+        self._validate_length(len(self) + 1)
+        old = list(self)
+        length = len(self)
+        super().insert(index, value)
+        # normalize the insertion point for the notification
+        if index < 0:
+            index = max(length + index, 0)
+        elif index > length:
+            index = length
+        self._notify("insert", old, index)
+
+    def remove(self, value: t.Any) -> None:
+        index = self.index(value)  # raises ValueError before any mutation
+        old = list(self)
+        super().remove(value)
+        self._notify("remove", old, index)
+
+    def pop(self, index: int = -1) -> t.Any:
+        normalized = index + len(self) if index < 0 else index
+        old = list(self)
+        value = super().pop(index)  # raises IndexError before any mutation
+        self._notify("pop", old, normalized)
+        return value
+
+    def clear(self) -> None:
+        if not self:
+            return
+        old = list(self)
+        super().clear()
+        self._notify("clear", old)
+
+    def sort(self, *, key: t.Any = None, reverse: bool = False) -> None:
+        old = list(self)
+        super().sort(key=key, reverse=reverse)
+        self._notify("sort", old)
+
+    def reverse(self) -> None:
+        old = list(self)
+        super().reverse()
+        self._notify("reverse", old)
+
+    def __setitem__(self, index: t.Any, value: t.Any) -> None:
+        if isinstance(index, slice):
+            # validate the whole batch before mutating (atomic replacement)
+            values = [self._validate_element(v) for v in value]
+            if index.step in (None, 1):
+                self._validate_length(len(self) - len(self[index]) + len(values))
+            old = list(self)
+            super().__setitem__(index, values)
+            self._notify("setitem", old, index)
+        else:
+            value = self._validate_element(value)
+            old = list(self)
+            super().__setitem__(index, value)
+            if index < 0:
+                index += len(self)
+            self._notify("setitem", old, index)
+
+    def __delitem__(self, index: t.Any) -> None:
+        old = list(self)
+        normalized = index
+        if isinstance(index, int) and index < 0:
+            normalized = index + len(self)
+        super().__delitem__(index)
+        self._notify("delitem", old, normalized)
+
+    def __iadd__(self, values: t.Iterable[t.Any]) -> Self:
+        self.extend(values)
+        return self
+
+    def __imul__(self, n: t.Any) -> Self:
+        new_length = len(self) * n
+        self._validate_length(new_length if new_length > 0 else 0)
+        old = list(self)
+        super().__imul__(n)
+        self._notify("imul", old)
+        return self
+
+
+class _ObservableDict(dict):  # type:ignore[type-arg]
+    """A ``dict`` subclass that validates in-place mutations and notifies its owner.
+
+    Instances of this class are created and managed by :class:`ObservableDict`
+    traits; it is not meant to be instantiated directly. See
+    :class:`_ObservableList` for the observation, nesting and re-binding
+    semantics, which are identical.
+    """
+
+    _owner: HasTraits | None = None
+    _trait: ObservableDict | None = None
+
+    def _bind(self, owner: HasTraits, trait: ObservableDict) -> Self:
+        """Attach this container to an owner, detaching it from any previous one."""
+        self._owner = owner
+        self._trait = trait
+        return self
+
+    def _validate_key(self, key: t.Any) -> t.Any:
+        if self._owner is None or self._trait is None:
+            return key
+        return self._trait._validate_key(self._owner, key)
+
+    def _validate_value(self, key: t.Any, value: t.Any) -> t.Any:
+        if self._owner is None or self._trait is None:
+            return value
+        return self._trait._validate_value(self._owner, key, value)
+
+    def _notify(self, operation: str, old: dict[t.Any, t.Any], key: t.Any = None) -> None:
+        owner, trait = self._owner, self._trait
+        if owner is None or trait is None or trait.name is None:
+            return
+        owner.notify_change(
+            Bunch(
+                name=trait.name,
+                owner=owner,
+                type="change",
+                old=old,
+                new=self,
+                operation=operation,
+                key=key,
+            )
+        )
+
+    def __setitem__(self, key: t.Any, value: t.Any) -> None:
+        key = self._validate_key(key)
+        value = self._validate_value(key, value)
+        old = dict(self)
+        super().__setitem__(key, value)
+        self._notify("setitem", old, key)
+
+    def __delitem__(self, key: t.Any) -> None:
+        old = dict(self)
+        super().__delitem__(key)
+        self._notify("delitem", old, key)
+
+    def update(self, *args: t.Any, **kwargs: t.Any) -> None:
+        other = dict(*args, **kwargs)
+        # validate every entry before mutating, so a failure midway
+        # through the batch leaves the container untouched
+        validated = {}
+        for key, value in other.items():
+            key = self._validate_key(key)
+            validated[key] = self._validate_value(key, value)
+        old = dict(self)
+        super().update(validated)
+        self._notify("update", old, list(validated))
+
+    def setdefault(self, key: t.Any, default: t.Any = None) -> t.Any:
+        if key in self:
+            return self[key]
+        key = self._validate_key(key)
+        default = self._validate_value(key, default)
+        old = dict(self)
+        result = super().setdefault(key, default)
+        self._notify("setdefault", old, key)
+        return result
+
+    def pop(self, key: t.Any, *default: t.Any) -> t.Any:
+        if key not in self:
+            # raises KeyError or returns the default, without mutating
+            return super().pop(key, *default)
+        old = dict(self)
+        result = super().pop(key)
+        self._notify("pop", old, key)
+        return result
+
+    def popitem(self) -> t.Any:
+        old = dict(self)
+        key, value = super().popitem()  # raises KeyError before any mutation
+        self._notify("popitem", old, key)
+        return key, value
+
+    def clear(self) -> None:
+        if not self:
+            return
+        old = dict(self)
+        super().clear()
+        self._notify("clear", old)
+
+    def __ior__(self, other: t.Any) -> Self:
+        self.update(other)
+        return self
+
+
+class ObservableList(List[T]):
+    """An opt-in :class:`List` trait whose value is observable in-place.
+
+    The value of this trait is a ``list`` subclass which validates elements
+    on every in-place mutation (``append``, ``extend``, ``insert``,
+    ``remove``, ``pop``, item and slice assignment/deletion, ...) and emits
+    a change notification to the owner's observers for each mutation.
+
+    Notifications are regular ``change`` events with two extra keys:
+
+    * ``operation``: the name of the mutation (e.g. ``"append"``,
+      ``"setitem"``, ``"delitem"``),
+    * ``index``: the affected position(s) -- an int for single-element
+      operations, a ``slice`` for range operations, ``None`` for
+      whole-container operations (``clear``, ``sort``, ``reverse``).
+
+    ``old`` holds a plain ``list`` snapshot of the container before the
+    mutation and ``new`` is the live container itself.
+
+    Batch mutations (``extend``, slice assignment) are atomic: all elements
+    are validated before any mutation happens, so an invalid element leaves
+    both the value and the notifications untouched.
+
+    Observation is shallow (nested containers are not recursively observed)
+    and assigning the container to another instance re-binds it to the new
+    owner. Plain :class:`List` traits are unaffected by all of this.
+    """
+
+    def validate(self, obj: t.Any, value: t.Any) -> t.Any:
+        if isinstance(value, _ObservableList):
+            # re-bind to the new owner, detaching from any previous one
+            return value._bind(obj, self)
+        value = super().validate(obj, value)
+        if value is None:
+            return None
+        return _ObservableList(value)._bind(obj, self)
+
+    def _validate_element(self, obj: t.Any, value: t.Any) -> t.Any:
+        if self._trait is None or isinstance(self._trait, Any):
+            return value
+        try:
+            return self._trait._validate(obj, value)
+        except TraitError as error:
+            self.error(obj, value, error)
+
+    def _validate_length(self, obj: t.Any, length: int) -> None:
+        if length < self._minlen or length > self._maxlen:
+            raise TraitError(
+                f"The '{self.name}' trait of {class_of(obj)} instance must be of length"
+                f" {self._minlen:d} <= L <= {self._maxlen:d},"
+                f" but the mutation would result in a length of {length:d}."
+            )
+
+
+class ObservableDict(Dict):
+    """An opt-in :class:`Dict` trait whose value is observable in-place.
+
+    The value of this trait is a ``dict`` subclass which validates keys and
+    values on every in-place mutation (``__setitem__``, ``__delitem__``,
+    ``update``, ``pop``, ``popitem``, ``setdefault``, ``clear``) and emits a
+    change notification to the owner's observers for each mutation.
+
+    Notifications are regular ``change`` events with two extra keys:
+
+    * ``operation``: the name of the mutation (e.g. ``"setitem"``,
+      ``"update"``, ``"pop"``),
+    * ``key``: the affected key -- for ``update``, the list of affected keys.
+
+    ``old`` holds a plain ``dict`` snapshot of the container before the
+    mutation and ``new`` is the live container itself.
+
+    Batch mutations (``update``) are atomic: all entries are validated
+    before any mutation happens, so an invalid key or value leaves both the
+    value and the notifications untouched.
+
+    Observation is shallow (nested containers are not recursively observed)
+    and assigning the container to another instance re-binds it to the new
+    owner. Plain :class:`Dict` traits are unaffected by all of this.
+    """
+
+    def validate(self, obj: t.Any, value: t.Any) -> t.Any:
+        if isinstance(value, _ObservableDict):
+            # re-bind to the new owner, detaching from any previous one
+            return value._bind(obj, self)
+        value = super().validate(obj, value)
+        if value is None:
+            return None
+        return _ObservableDict(value)._bind(obj, self)
+
+    def _validate_key(self, obj: t.Any, key: t.Any) -> t.Any:
+        if self._key_trait is None:
+            return key
+        try:
+            return self._key_trait._validate(obj, key)
+        except TraitError:
+            self.element_error(obj, key, self._key_trait, "Keys")
+
+    def _validate_value(self, obj: t.Any, key: t.Any, value: t.Any) -> t.Any:
+        active_value_trait = (self._per_key_traits or {}).get(key, self._value_trait)
+        if active_value_trait is None:
+            return value
+        try:
+            return active_value_trait._validate(obj, value)
+        except TraitError:
+            self.element_error(obj, value, active_value_trait, "Values")
 
 
 class TCPAddress(TraitType[G, S]):

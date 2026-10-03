@@ -84,6 +84,28 @@ Containers
 .. autoclass:: Dict
    :members: __init__, from_string_list, item_from_string
 
+Observable containers
+---------------------
+
+.. autoclass:: ObservableList
+   :members: __init__
+
+.. autoclass:: ObservableDict
+   :members: __init__
+
+Unlike plain :class:`List` and :class:`Dict` traits, whose values only
+notify observers when the whole container is *reassigned*, the values of
+``ObservableList`` and ``ObservableDict`` traits validate elements and
+notify observers on every in-place mutation (``append``, ``insert``,
+slice assignment, ``update``, ...). Each notification is a regular
+``change`` event with an extra ``operation`` key and an ``index`` (lists)
+or ``key`` (dicts) key describing the affected position. Batch mutations
+validate all elements before applying anything, so a rejected batch
+leaves the value and the notifications untouched. Observation is shallow
+(nested containers are not recursively observed), and assigning the
+container to another instance re-binds it to the new owner, so further
+notifications are only sent there.
+
 Classes and instances
 ---------------------
 
