@@ -18,6 +18,7 @@ from traitlets.traitlets import (
     Dict,
     HasTraits,
     Instance,
+    TraitError,
     TraitType,
     default,
     observe,
@@ -255,6 +256,92 @@ class Configurable(HasTraits):
         self.config.merge(config)
         # TODO: trigger change event if/when dict-update change events take place
         # DO NOT trigger full trait-change
+
+    @contextlib.contextmanager
+    def _change_validation_context(self) -> t.Iterator[None]:
+        original_trait_values = self._trait_values
+        original_cross_validation_lock = self._cross_validation_lock
+        original_change_validation = self._change_validation_active
+        original_notify_observers = self.__dict__.get("_notify_observers")
+        had_notify_observers = original_notify_observers is not None
+
+        self._trait_values = original_trait_values.copy()
+        self._cross_validation_lock = False
+        self._change_validation_active = True
+
+        def ignore_event(event: Bunch) -> None:
+            return None
+
+        self._notify_observers = ignore_event
+        try:
+            yield
+        finally:
+            self._trait_values = original_trait_values
+            self._cross_validation_lock = original_cross_validation_lock
+            self._change_validation_active = original_change_validation
+            if had_notify_observers:
+                self._notify_observers = original_notify_observers
+            else:
+                self.__dict__.pop("_notify_observers", None)
+
+    def validate_changes(
+        self, changes: dict[str, t.Any]
+    ) -> tuple[dict[str, t.Any], dict[str, TraitError]]:
+        """Validate proposed trait changes without applying them.
+
+        Parameters
+        ----------
+        changes : dict
+            Proposed trait values, keyed by trait name.
+
+        Returns
+        -------
+        candidate_values : dict
+            Normalized values for the proposed traits that do not have errors.
+        errors : dict
+            Trait errors keyed by the proposed trait name.
+
+        Cross-validators see proposed values for other traits in ``changes`` and
+        current values for traits that were not proposed. Dynamic defaults used
+        during validation are stored only in the temporary candidate state.
+        Validators must not modify traits during validation; such an attempt is
+        reported as an error for the trait being validated.
+        """
+        traits = self.traits()
+        staged_values: dict[str, t.Any] = {}
+        errors: dict[str, TraitError] = {}
+
+        for name in changes:
+            trait = traits.get(name)
+            if trait is None:
+                errors[name] = TraitError(
+                    f"Class {self.__class__.__name__} does not have a trait named {name}"
+                )
+                continue
+            if trait.read_only:
+                errors[name] = TraitError(f'The "{name}" trait is read-only.')
+
+        with self._change_validation_context():
+            for name, value in changes.items():
+                if name in errors:
+                    continue
+                trait = traits[name]
+                try:
+                    with self.cross_validation_lock:
+                        staged_values[name] = trait._validate(self, value)
+                except TraitError as error:
+                    errors[name] = error
+
+            self._trait_values.update(staged_values)
+            candidate_values = staged_values.copy()
+            for name, value in staged_values.items():
+                try:
+                    candidate_values[name] = traits[name]._cross_validate(self, value)
+                except TraitError as error:
+                    errors[name] = error
+                    candidate_values.pop(name, None)
+
+        return candidate_values, errors
 
     @classmethod
     def class_get_help(cls, inst: HasTraits | None = None) -> str:

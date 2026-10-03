@@ -737,6 +737,11 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
             return self.get(obj, cls)  # type:ignore[return-value]
 
     def set(self, obj: HasTraits, value: S) -> None:
+        if obj._change_validation_active:
+            assert self.name is not None
+            raise TraitError(
+                f'Cannot modify the "{self.name}" trait while validating proposed changes.'
+            )
         new_value = self._validate(obj, value)
         assert self.name is not None
         try:
@@ -770,6 +775,10 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
         delattr stores a sentinel so `hasattr` returns False
         """
         assert self.name is not None
+        if obj._change_validation_active:
+            raise TraitError(
+                f'Cannot delete the "{self.name}" trait while validating proposed changes.'
+            )
         obj._trait_values[self.name] = _DELETED
 
     def _validate(self, obj: t.Any, value: t.Any) -> G | None:
@@ -1371,6 +1380,7 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _trait_notifiers: dict[str | Sentinel, t.Any]
     _trait_validators: dict[str | Sentinel, t.Any]
     _cross_validation_lock: bool
+    _change_validation_active: bool
     _traits: dict[str, t.Any]
     _all_trait_default_generators: dict[str, t.Any]
 
@@ -1382,6 +1392,7 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         self._trait_notifiers = {}
         self._trait_validators = {}
         self._cross_validation_lock = False
+        self._change_validation_active = False
         super(HasTraits, self).setup_instance(*args, **kwargs)
 
     def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:

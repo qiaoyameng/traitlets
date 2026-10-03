@@ -24,6 +24,7 @@ from traitlets.config.configurable import (
 from traitlets.config.loader import Config
 from traitlets.log import get_logger
 from traitlets.traitlets import (
+    CInt,
     CaselessStrEnum,
     Dict,
     Enum,
@@ -32,7 +33,10 @@ from traitlets.traitlets import (
     Integer,
     List,
     Set,
+    TraitError,
     Unicode,
+    default,
+    observe,
     validate,
 )
 from traitlets.utils.warnings import _deprecations_shown
@@ -975,3 +979,181 @@ def test_get_log_handler_deprecated():
     app = Application(log=logging.getLogger("test_get_log_handler_deprecated"))
     with pytest.deprecated_call(match="_get_log_handler has been deprecated"):
         app._get_log_handler()
+
+
+def test_validate_changes_candidates_and_isolation():
+    class Panel(Configurable):
+        minimum = CInt(0).tag(config=True)
+        maximum = CInt(10).tag(config=True)
+        derived = Unicode().tag(config=True)
+
+        default_calls = 0
+
+        @validate("minimum", "maximum")
+        def _validate_bounds(self, proposal):
+            value = proposal.value
+            name = proposal.trait.name
+            if name == "minimum":
+                if value > self.maximum:
+                    raise TraitError("minimum must not exceed maximum")
+            else:
+                if value < self.minimum:
+                    raise TraitError("maximum must not be below minimum")
+            return value
+
+        @default("derived")
+        def _derived_default(self):
+            self.default_calls += 1
+            return f"{self.minimum}:{self.maximum}"
+
+    panel = Panel(minimum=2, maximum=8)
+    events = []
+    panel.observe(events.append)
+
+    values, errors = panel.validate_changes({"minimum": 4, "maximum": "6"})
+
+    assert values == {"minimum": 4, "maximum": 6}
+    assert errors == {}
+    assert panel.minimum == 2
+    assert panel.maximum == 8
+    assert not panel.trait_has_value("derived")
+    assert panel.default_calls == 0
+    assert events == []
+
+    panel.derived
+    assert panel.default_calls == 1
+    cache_before_validation = panel._trait_values.copy()
+    values, errors = panel.validate_changes({"minimum": 5, "maximum": 7})
+
+    assert values == {"minimum": 5, "maximum": 7}
+    assert errors == {}
+    assert panel._trait_values == cache_before_validation
+    assert panel.minimum == 2
+    assert panel.maximum == 8
+    assert panel.derived == "2:8"
+    assert panel.default_calls == 1
+    assert events == []
+
+    values, errors = panel.validate_changes({"minimum": 9})
+
+    assert values == {}
+    assert set(errors) == {"minimum"}
+    assert "minimum must not exceed maximum" in str(errors["minimum"])
+    assert panel.minimum == 2
+    assert events == []
+
+    with panel.hold_trait_notifications():
+        panel.minimum = 5
+        panel.maximum = 7
+
+    assert panel.minimum == 5
+    assert panel.maximum == 7
+    assert len(events) == 2
+
+
+def test_validate_changes_uses_default_and_rejects_writes_read_only_and_unknown():
+    class Panel(Configurable):
+        minimum = CInt(0).tag(config=True)
+        maximum = CInt().tag(config=True)
+        derived = Unicode(read_only=True).tag(config=True)
+        derived_writable = Unicode().tag(config=True)
+
+        @default("maximum")
+        def _maximum_default(self):
+            return 10
+
+        @validate("minimum")
+        def _validate_minimum(self, proposal):
+            if proposal.value > self.maximum:
+                self.maximum = proposal.value
+            return proposal.value
+
+        @validate("derived_writable")
+        def _validate_derived(self, proposal):
+            self.set_trait("maximum", 99)
+            return proposal.value
+
+    panel = Panel()
+    events = []
+    panel.observe(events.append, type="change")
+    panel.observe(events.append, type="default")
+
+    values, errors = panel.validate_changes(
+        {
+            "minimum": 3,
+            "maximum": "7",
+            "derived": "locked",
+            "derived_writable": "x",
+            "unknown": 1,
+        }
+    )
+
+    assert values == {"minimum": 3, "maximum": 7}
+    assert set(errors) == {"derived", "derived_writable", "unknown"}
+    assert "read-only" in str(errors["derived"])
+    assert 'Cannot modify the "maximum" trait' in str(errors["derived_writable"])
+    assert "does not have a trait named unknown" in str(errors["unknown"])
+    assert not panel.trait_has_value("maximum")
+    assert events == []
+    assert panel.minimum == 0
+    assert panel.maximum == 10
+    events.clear()
+
+    values, errors = panel.validate_changes({"minimum": 11})
+
+    assert values == {}
+    assert set(errors) == {"minimum"}
+    assert 'Cannot modify the "maximum" trait' in str(errors["minimum"])
+    assert panel.minimum == 0
+    assert panel.maximum == 10
+    assert events == []
+
+    values, errors = panel.validate_changes({"derived_writable": "y"})
+
+    assert values == {}
+    assert set(errors) == {"derived_writable"}
+    assert 'Cannot modify the "maximum" trait' in str(errors["derived_writable"])
+    assert panel.maximum == 10
+
+
+def test_validate_changes_dynamic_default_is_trial_only():
+    class Panel(Configurable):
+        minimum = CInt(0).tag(config=True)
+        maximum = CInt().tag(config=True)
+
+        default_calls = 0
+
+        @default("maximum")
+        def _maximum_default(self):
+            self.default_calls += 1
+            return self.minimum + 10
+
+        @validate("minimum")
+        def _validate_minimum(self, proposal):
+            if proposal.value > self.maximum:
+                raise TraitError("minimum must not exceed maximum")
+            return proposal.value
+
+    panel = Panel()
+    events = []
+    panel.observe(events.append, type="change")
+    panel.observe(events.append, type="default")
+
+    assert not panel.trait_has_value("maximum")
+    values, errors = panel.validate_changes({"minimum": 5})
+
+    assert values == {"minimum": 5}
+    assert errors == {}
+    assert panel.default_calls == 1
+    assert not panel.trait_has_value("maximum")
+    assert panel.minimum == 0
+    assert events == []
+
+    values, errors = panel.validate_changes({"minimum": 6})
+
+    assert values == {"minimum": 6}
+    assert errors == {}
+    assert panel.default_calls == 2
+    assert not panel.trait_has_value("maximum")
+    assert panel.minimum == 0
+    assert events == []
