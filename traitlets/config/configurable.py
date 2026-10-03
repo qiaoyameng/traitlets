@@ -28,7 +28,14 @@ from traitlets.utils import warnings
 from traitlets.utils.bunch import Bunch
 from traitlets.utils.text import indent, wrap_paragraphs
 
-from .loader import Config, DeferredConfig, LazyConfigValue, _is_section_key
+from .loader import (
+    SOURCE_DEFAULT,
+    Config,
+    DeferredConfig,
+    LazyConfigValue,
+    SourceRecord,
+    _is_section_key,
+)
 
 if t.TYPE_CHECKING:
     from typing_extensions import Self
@@ -94,6 +101,10 @@ class Configurable(HasTraits):
 
         config = kwargs.pop("config", None)
 
+        # provenance of the effective value of each configurable trait:
+        # {trait_name: {"records": [...], "elements": aligned sources}}
+        self._config_trait_sources: dict[str, dict[str, t.Any]] = {}
+
         # load kwarg traits, other than config
         super().__init__(**kwargs)
 
@@ -127,6 +138,21 @@ class Configurable(HasTraits):
 
         for name in config_override_names:
             setattr(self, name, kwargs[name])
+            # explicit constructor arguments take precedence over config
+            self._config_trait_sources[name] = {
+                "records": [SourceRecord("constructor", "set")],
+                "elements": None,
+            }
+
+        # traits passed as plain constructor kwargs are explicit overrides
+        # too; mark them unless config loading already explained the value
+        trait_names = set(self.traits(config=True))
+        for name in kwargs:
+            if name in trait_names and name not in self._config_trait_sources:
+                self._config_trait_sources[name] = {
+                    "records": [SourceRecord("constructor", "set")],
+                    "elements": None,
+                }
 
     # -------------------------------------------------------------------------
     # Static trait notifications
@@ -192,14 +218,20 @@ class Configurable(HasTraits):
                         # ConfigValue is a wrapper for using append / update on containers
                         # without having to copy the initial value
                         initial = getattr(self, name)
-                        config_value = config_value.get_value(initial)
+                        config_value, element_sources = config_value.resolve(initial)
                     elif isinstance(config_value, DeferredConfig):
                         # DeferredConfig tends to come from CLI/environment variables
                         config_value = config_value.get_value(traits[name])
+                        element_sources = None
+                    else:
+                        element_sources = None
                     # We have to do a deepcopy here if we don't deepcopy the entire
                     # config object. If we don't, a mutable config_value will be
                     # shared by all instances, effectively making it a class attribute.
                     setattr(self, name, deepcopy(config_value))
+                    self._record_trait_source(
+                        name, config_value, my_config, element_sources
+                    )
                 elif not _is_section_key(name) and not isinstance(config_value, Config):
                     from difflib import get_close_matches
 
@@ -221,6 +253,145 @@ class Configurable(HasTraits):
                             matches=", ".join(sorted(matches))
                         )
                     warn(msg)
+
+    def _record_trait_source(
+        self,
+        name: str,
+        value: t.Any,
+        my_config: Config,
+        element_sources: t.Any,
+    ) -> None:
+        """Store resolved provenance for one trait after loading config.
+
+        Only readable source labels and operation names are stored;
+        trait values are never duplicated here.
+        """
+        trace = my_config.get_trace(name)
+        if trace is None:
+            records: list[SourceRecord] = []
+        else:
+            records = list(trace.records)
+
+        if element_sources is None and trace is not None:
+            element_sources = trace.element_sources
+
+        if not records:
+            records = [SourceRecord(SOURCE_DEFAULT, "default")]
+
+        self._config_trait_sources[name] = {
+            "records": records,
+            "elements": element_sources,
+        }
+
+    def config_source_records(self, trait_name: str) -> list[SourceRecord]:
+        """Return the provenance chain for ``trait_name``, oldest first.
+
+        Every entry is a :class:`~traitlets.config.loader.SourceRecord`
+        holding a readable source label (e.g. a file path,
+        ``command-line``, ``environment``, ``unknown``, ``default``)
+        and the operation that set or changed the value
+        (``set``, ``append``, ``prepend``, ``insert``, ``update``,
+        ``default``).
+
+        The last entry explains the final value. For traits whose final
+        value is the class default the chain contains the single
+        ``("default", "default")`` record.
+        """
+        info = self._config_trait_sources.get(trait_name)
+        if info is not None:
+            return list(info["records"])
+        if trait_name in self.traits(config=True):
+            return [SourceRecord(SOURCE_DEFAULT, "default")]
+        raise AttributeError(
+            f"{self.__class__.__name__!s} has no config trait {trait_name!r}"
+        )
+
+    def config_source(self, trait_name: str) -> str:
+        """Return the readable source label of the final trait value.
+
+        Examples: a config file path, ``command-line``, ``environment``,
+        ``unknown`` for values supplied directly in user code, and
+        ``default`` when the class default is in effect.
+        """
+        return self.config_source_records(trait_name)[-1].source
+
+    def config_element_sources(self, trait_name: str) -> t.Any:
+        """Return per-element provenance for a container trait.
+
+        * list traits return a list of :class:`SourceRecord`
+        * dict traits return a ``{key: SourceRecord}`` mapping
+        * set traits return a ``{element: SourceRecord}`` mapping
+        * scalars return a single :class:`SourceRecord`
+
+        Raises ``TypeError`` if the trait is not a supported container.
+        """
+        self.config_source_records(trait_name)  # existence check
+        info = self._config_trait_sources.get(trait_name, {})
+        elements = info.get("elements")
+        if elements is not None:
+            return elements
+        record = self.config_source_records(trait_name)[-1]
+        value = getattr(self, trait_name)
+        if isinstance(value, list):
+            return [record] * len(value)
+        if isinstance(value, (dict, set)):
+            return {key: record for key in value}
+        return record
+
+    def explain_config_value(
+        self,
+        trait_name: str,
+        include_value: bool = False,
+    ) -> str:
+        """Return a human-readable explanation of where a trait value came from.
+
+        Lists the full override chain (oldest to newest) and the winning
+        source. For container traits, per-element sources are included.
+
+        Config values are never shown unless ``include_value=True`` is
+        explicitly passed. This method only inspects provenance metadata
+        recorded while loading config; it never re-executes Python config
+        files.
+        """
+        records = self.config_source_records(trait_name)
+        lines = [f"{self.__class__.__name__}.{trait_name}:"]
+        lines.append("  source chain (oldest first):")
+        for record in records:
+            if record.operation in {"set", "default"}:
+                lines.append(f"    - {record.source}")
+            else:
+                lines.append(f"    - {record.source} ({record.operation})")
+        lines.append(f"  final source: {records[-1].source}")
+
+        elements = None
+        info = self._config_trait_sources.get(trait_name)
+        if info is not None:
+            elements = info.get("elements")
+        value = getattr(self, trait_name)
+        if isinstance(value, list) and elements is not None:
+            lines.append("  items:")
+            for item, record in zip(value, elements):
+                shown = repr(item) if include_value else "<value>"
+                if record.operation == "set":
+                    lines.append(f"    - {shown}: {record.source}")
+                else:
+                    lines.append(
+                        f"    - {shown}: {record.source} ({record.operation})"
+                    )
+        elif isinstance(value, dict) and elements is not None:
+            lines.append("  entries:")
+            for key, record in elements.items():
+                key_shown = repr(key) if include_value else "<key>"
+                if record.operation == "set":
+                    lines.append(f"    - {key_shown}: {record.source}")
+                else:
+                    lines.append(
+                        f"    - {key_shown}: {record.source} ({record.operation})"
+                    )
+
+        if include_value:
+            lines.append(f"  value: {value!r}")
+        return "\n".join(lines)
 
     @observe("config")
     @observe_compat

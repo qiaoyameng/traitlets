@@ -1143,6 +1143,40 @@ which an :class:`~traitlets.config.Application` is used. Some known caveats:
 More details about these caveats can be found in the `original pull request <https://github.com/ipython/traitlets/pull/811>`__.
 
 
+Value provenance
+================
+
+When debugging configuration it is useful to know whether the final value of a
+trait came from the default, a configuration file, the command line, or a
+plain ``Config`` object built in user code, and which source overwrote which.
+This information is recorded automatically while config is loaded and merged.
+
+Every piece of provenance is a :class:`~traitlets.config.SourceRecord` with a
+human-readable ``source`` label and an ``operation`` name. No configuration
+values are stored in the provenance, so secret values remain in the
+:class:`~traitlets.config.Config` itself. Common labels are:
+
+* ``default`` for trait defaults
+* the resolved config file path for values loaded from files
+* ``command-line`` for command-line arguments
+* ``environment`` for environment variables
+* ``unknown`` for values supplied directly in user code
+
+Provenance follows nested ``Section`` keys, inherited class sections, and
+:class:`~traitlets.config.loader.LazyConfigValue` ``append``/``prepend``/
+``insert``/``update`` operations. It can be queried from any
+:class:`~traitlets.config.Configurable`::
+
+    app.config_source("handlers")              # winning source label
+    app.config_source_records("handlers")     # full override chain
+    app.config_element_sources("options")     # per-element provenance
+    print(app.explain_config_value("handlers"))  # readable explanation
+
+``explain_config_value`` only reads the recorded provenance; it never
+re-executes Python configuration files, and it hides values unless
+``include_value=True`` is passed explicitly.
+
+
 Design requirements
 ===================
 

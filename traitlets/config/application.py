@@ -24,6 +24,7 @@ from traitlets.config.loader import (
     JSONFileConfigLoader,
     KVArgParseConfigLoader,
     PyFileConfigLoader,
+    SOURCE_ENVIRONMENT,
 )
 from traitlets.traitlets import (
     Bool,
@@ -980,7 +981,7 @@ class Application(SingletonConfigurable):
     def load_config_environ(self) -> None:
         """Load config files by environment."""
         PREFIX = self.name.upper().replace("-", "_")
-        new_config = Config()
+        new_config = Config(source=SOURCE_ENVIRONMENT)
 
         self.log.debug('Looping through config variables with prefix "%s"', PREFIX)
 

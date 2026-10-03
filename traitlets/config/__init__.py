@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .application import *
 from .configurable import *
-from .loader import Config
+from .loader import SOURCE_DEFAULT, SOURCE_UNKNOWN, Config, SourceRecord
 
 __all__ = [
     "Application",
@@ -17,5 +17,8 @@ __all__ = [
     "MultipleInstanceError",
     "SingletonConfigurable",
     "SingletonScope",
+    "SourceRecord",
+    "SOURCE_DEFAULT",
+    "SOURCE_UNKNOWN",
     "configurable",
 ]

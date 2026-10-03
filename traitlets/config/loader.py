@@ -39,6 +39,134 @@ class ArgumentError(ConfigLoaderError):
 
 
 # -----------------------------------------------------------------------------
+# Source tracking
+# -----------------------------------------------------------------------------
+
+
+#: Human-readable label used when a value comes from the trait default.
+SOURCE_DEFAULT = "default"
+#: Human-readable label used for values supplied directly in user code
+#: (e.g. ``Config(...)`` or ``c.Foo.bar = 1`` outside of a known loader).
+SOURCE_UNKNOWN = "unknown"
+#: Human-readable label for values parsed from command-line arguments.
+SOURCE_COMMAND_LINE = "command-line"
+#: Human-readable label for values coming from environment variables.
+SOURCE_ENVIRONMENT = "environment"
+
+
+class SourceRecord(t.NamedTuple):
+    """A readable provenance record for a config value.
+
+    Only the *source* label (e.g. a config file path, ``command-line``)
+    and the *operation* that produced/changed the value are stored.
+    Config values themselves are never duplicated here, so secrets stay
+    in the regular :class:`Config` only.
+    """
+
+    source: str
+    operation: str = "set"
+
+    def __repr__(self) -> str:
+        if self.operation == "set":
+            return f"<SourceRecord source={self.source!r}>"
+        return f"<SourceRecord source={self.source!r} operation={self.operation!r}>"
+
+
+def _record(source: str, operation: str = "set") -> SourceRecord:
+    if isinstance(source, SourceRecord):
+        return source
+    return SourceRecord(source, operation)
+
+
+class _LeafTrace:
+    """Provenance history attached to one (non-section) Config leaf.
+
+    * ``clobbers``: records of plain assignments, oldest first.
+      Every entry is a value that replaced everything before it, so the
+      effective history starts at the last such entry.
+    * ``lazy``: records of container mutations (append/prepend/insert/update)
+      that followed the last clobber, oldest first.
+
+    The structure holds no config values, only readable source labels.
+    """
+
+    __slots__ = ("clobbers", "lazy", "element_sources")
+
+    def __init__(
+        self,
+        clobbers: list[SourceRecord] | None = None,
+        lazy: list[SourceRecord] | None = None,
+        element_sources: t.Any = None,
+    ) -> None:
+        self.clobbers: list[SourceRecord] = clobbers or []
+        self.lazy: list[SourceRecord] = lazy or []
+        # when a value is already reified (a plain container), this holds
+        # SourceRecords aligned with its elements; None for uniform origins
+        self.element_sources = element_sources
+
+    def copy(self) -> _LeafTrace:
+        return _LeafTrace(
+            list(self.clobbers), list(self.lazy), self.element_sources
+        )
+
+    @property
+    def records(self) -> list[SourceRecord]:
+        """Effective record chain, oldest to newest."""
+        return self.clobbers + self.lazy
+
+    def __repr__(self) -> str:
+        return f"_LeafTrace({self.records!r})"
+
+
+def _lazy_trace(value: LazyConfigValue) -> _LeafTrace:
+    """Build a trace from the per-operation tags on a LazyConfigValue."""
+    records: list[SourceRecord] = []
+    records.extend(value._src_itags)
+    records.extend(value._src_ptags)
+    records.extend(value._src_xtags)
+    records.extend(value._src_utags.values())
+    if not records and value._source_record is not None:
+        # auto-vivified lazy with no explicit operations yet
+        records = [SourceRecord(value._source_record.source, "set")]
+    return _LeafTrace([], records)
+
+
+def _combine_traces(
+    own: _LeafTrace | None,
+    incoming: _LeafTrace | None,
+    *,
+    incoming_is_lazy: bool = False,
+) -> _LeafTrace | None:
+    """Combine traces when merging one Config leaf into another.
+
+    ``self`` (own) has lower precedence than ``incoming``.
+
+    * both plain assignments: keep the full override chain; the incoming
+      assignment starts a new effective clobber.
+    * incoming lazy mutation: replay the incoming mutations after the
+      current effective value (own clobber wins as the base).
+    * incoming plain assignment while own is lazy: the lazy mutations
+      still describe mutations of the earlier base, and the plain
+      assignment then overrides the result.
+    """
+    if incoming is None:
+        return own.copy() if own is not None else None
+    if own is None:
+        return incoming.copy()
+
+    if incoming_is_lazy:
+        # element alignment is recomputed by Config.merge at reification
+        return _LeafTrace(list(own.clobbers), own.lazy + incoming.records)
+
+    # incoming has a plain (clobbering) assignment
+    return _LeafTrace(
+        own.records + incoming.clobbers,
+        list(incoming.lazy),
+        incoming.element_sources,
+    )
+
+
+# -----------------------------------------------------------------------------
 # Argparse fix
 # -----------------------------------------------------------------------------
 
@@ -96,17 +224,94 @@ class LazyConfigValue(HasTraits):
     _prepend: List[t.Any] = List()
     _inserts: List[t.Any] = List()
 
-    def append(self, obj: t.Any) -> None:
+    def __init__(
+        self,
+        source: str | SourceRecord | None = None,
+        operation: str = "set",
+    ) -> None:
+        super().__init__()
+        # provenance parallel to the operation containers above
+        self._src_xtags: list[SourceRecord] = []
+        self._src_ptags: list[SourceRecord] = []
+        self._src_itags: list[SourceRecord] = []
+        self._src_utags: dict[t.Any, SourceRecord] = {}
+        self._source_record = (
+            None
+            if source is None
+            else (
+                source
+                if isinstance(source, SourceRecord)
+                else SourceRecord(source, operation)
+            )
+        )
+
+    def _tag(self, operation: str) -> SourceRecord:
+        return SourceRecord(
+            (
+                self._source_record.source
+                if self._source_record is not None
+                else SOURCE_UNKNOWN
+            ),
+            operation,
+        )
+
+    def append(self, obj: t.Any, source: str | SourceRecord | None = None) -> None:
         """Append an item to a List"""
+        if source is not None:
+            tag = _record(source, "append")
+        else:
+            tag = self._tag("append")
         self._extend.append(obj)
+        self._src_xtags.append(tag)
 
-    def extend(self, other: t.Any) -> None:
+    def extend(
+        self,
+        other: t.Any,
+        source: str | SourceRecord | None = None,
+    ) -> None:
         """Extend a list"""
+        if source is not None:
+            tag = _record(source, "append")
+        else:
+            tag = self._tag("append")
         self._extend.extend(other)
+        self._src_xtags.extend([tag] * len(other))
 
-    def prepend(self, other: t.Any) -> None:
+    def prepend(
+        self,
+        other: t.Any,
+        source: str | SourceRecord | None = None,
+    ) -> None:
         """like list.extend, but for the front"""
+        if source is not None:
+            tag = _record(source, "prepend")
+        else:
+            tag = self._tag("prepend")
         self._prepend[:0] = other
+        self._src_ptags[:0] = [tag] * len(other)
+
+    def _merge_tags_into(self, other: LazyConfigValue) -> None:
+        """Merge provenance tags from self (higher precedence) into other."""
+        merged_xtags = list(other._src_xtags) + list(self._src_xtags)
+        other._src_xtags = merged_xtags
+        self._src_xtags = merged_xtags
+
+        merged_ptags = list(self._src_ptags) + list(other._src_ptags)
+        other._src_ptags = merged_ptags
+        self._src_ptags = merged_ptags
+
+        merged_itags = list(other._src_itags) + list(self._src_itags)
+        other._src_itags = merged_itags
+        self._src_itags = merged_itags
+
+        # dict/set update: incoming entries take precedence
+        merged = dict(other._src_utags)
+        merged.update(self._src_utags)
+        other._src_utags = merged
+        self._src_utags = merged
+
+        if self._source_record is not None and other._source_record is None:
+            other._source_record = self._source_record
 
     def merge_into(self, other: t.Any) -> t.Any:
         """
@@ -125,67 +330,180 @@ class LazyConfigValue(HasTraits):
             if ``other`` is also lazy, a reified container otherwise.
         """
         if isinstance(other, LazyConfigValue):
-            other._extend.extend(self._extend)
-            self._extend = other._extend
+            merged_extend = list(other._extend) + list(self._extend)
+            other._extend = merged_extend
+            self._extend = merged_extend
 
-            self._prepend.extend(other._prepend)
+            merged_prepend = list(self._prepend) + list(other._prepend)
+            other._prepend = merged_prepend
+            self._prepend = merged_prepend
 
-            other._inserts.extend(self._inserts)
-            self._inserts = other._inserts
+            merged_inserts = list(other._inserts) + list(self._inserts)
+            other._inserts = merged_inserts
+            self._inserts = merged_inserts
 
             if self._update:
-                other.update(self._update)
+                if other._update is None:
+                    if isinstance(self._update, dict):
+                        other._update = {}
+                    else:
+                        other._update = set()
+                other._update.update(self._update)
                 self._update = other._update
+            self._merge_tags_into(other)
             return self
         else:
             # other is a container, reify now.
             return self.get_value(other)
 
-    def insert(self, index: int, other: t.Any) -> None:
+    def insert(
+        self,
+        index: int,
+        other: t.Any,
+        source: str | SourceRecord | None = None,
+    ) -> None:
         if not isinstance(index, int):
             raise TypeError("An integer is required")
+        if source is not None:
+            tag = _record(source, "insert")
+        else:
+            tag = self._tag("insert")
         self._inserts.append((index, other))
+        self._src_itags.append(tag)
 
     # dict methods
     # update is used for both dict and set
     _update = Any()
 
-    def update(self, other: t.Any) -> None:
+    def update(
+        self,
+        other: t.Any,
+        source: str | SourceRecord | None = None,
+    ) -> None:
         """Update either a set or dict"""
+        if source is not None:
+            tag = _record(source, "update")
+        else:
+            tag = self._tag("update")
         if self._update is None:
             if isinstance(other, dict):
                 self._update = {}
             else:
                 self._update = set()
+        if isinstance(self._update, dict):
+            for key in other:
+                self._src_utags[key] = tag
+        else:
+            for item in other:
+                self._src_utags[item] = tag
         self._update.update(other)
 
     # set methods
-    def add(self, obj: t.Any) -> None:
+    def add(
+        self,
+        obj: t.Any,
+        source: str | SourceRecord | None = None,
+    ) -> None:
         """Add an item to a set"""
-        self.update({obj})
+        self.update({obj}, source=source)
 
     def get_value(self, initial: t.Any) -> t.Any:
         """construct the value from the initial one
 
         after applying any insert / extend / update changes
         """
+        value, _ = self.resolve(initial)
+        return value
+
+    @staticmethod
+    def _base_tag(seed: SourceRecord | None) -> SourceRecord:
+        if seed is not None:
+            return seed
+        return SourceRecord(SOURCE_DEFAULT, "default")
+
+    def resolve(
+        self,
+        initial: t.Any,
+        seed: SourceRecord | None = None,
+    ) -> tuple[t.Any, t.Any]:
+        """Return ``(value, element_sources)`` built from ``initial``.
+
+        Like :meth:`get_value`, but also returns provenance tags aligned
+        with every element of the resulting container:
+
+        * a list yields a list of :class:`SourceRecord` of the same length
+        * a dict yields a ``{key: SourceRecord}`` mapping
+        * a set yields a ``{element: SourceRecord}`` mapping
+        * any other value yields the single :class:`SourceRecord` in effect
+
+        ``seed`` describes the provenance of ``initial`` when known
+        (e.g. the last clobbering assignment). Elements untouched by lazy
+        operations are attributed to ``seed`` or to :data:`SOURCE_DEFAULT`.
+        No config values are stored in the provenance structures.
+        """
         if self._value is not None:
-            return self._value  # type:ignore[unreachable]
+            # get_value() may have cached the reified value earlier,
+            # without provenance information; rebuild source alignment
+            # from the cached value, treating it as the initial container.
+            cached_sources = getattr(self, "_value_sources", None)
+            if seed is not None or cached_sources is None:
+                value = self._value
+                base = self._base_tag(seed)
+                if isinstance(value, list):
+                    tags = (
+                        list(self._src_itags)
+                        + list(self._src_ptags)
+                        + list(self._src_xtags)
+                    )
+                    cached_sources = [base] * (len(value) - len(tags)) + tags
+                elif isinstance(value, dict):
+                    cached_sources = {
+                        key: self._src_utags.get(key, base) for key in value
+                    }
+                elif isinstance(value, set):
+                    cached_sources = {
+                        item: self._src_utags.get(item, base) for item in value
+                    }
+                else:
+                    cached_sources = seed or SourceRecord(SOURCE_DEFAULT, "default")
+                self._value_sources = cached_sources
+            return self._value, cached_sources  # type:ignore[unreachable]
         value = copy.deepcopy(initial)
+        base = self._base_tag(seed)
+        sources: t.Any
         if isinstance(value, list):
-            for idx, obj in self._inserts:
+            sources = [base] * len(value)
+            for (idx, obj), tag in zip(
+                self._inserts, self._src_itags, strict=True
+            ):
                 value.insert(idx, obj)
+                sources.insert(idx, tag)
             value[:0] = self._prepend
+            sources[:0] = list(self._src_ptags)
             value.extend(self._extend)
+            sources.extend(self._src_xtags)
 
         elif isinstance(value, dict):
+            sources = {key: base for key in value}
             if self._update:
+                for key, tag in self._src_utags.items():
+                    sources[key] = tag
                 value.update(self._update)
         elif isinstance(value, set):
+            sources = {item: base for item in value}
             if self._update:
+                for item, tag in self._src_utags.items():
+                    sources[item] = tag
                 value.update(self._update)
+        else:
+            # scalar: lazy container operations do not apply;
+            # the seed assignment (or the default) remains the source
+            sources = seed if seed is not None else SourceRecord(
+                SOURCE_DEFAULT, "default"
+            )
         self._value = value
-        return value
+        self._value_sources = sources
+        return value, sources
 
     def to_dict(self) -> dict[str, t.Any]:
         """return JSONable dict form of my data
@@ -215,6 +533,19 @@ def _is_section_key(key: str) -> bool:
     return bool(key and key[0].upper() == key[0] and not key.startswith("_"))
 
 
+def _reconstruct_config(
+    cls: type[Config],
+    data: dict[str, t.Any],
+    source: str | None,
+    traces: dict[str, _LeafTrace],
+) -> Config:
+    config = cls.__new__(cls)
+    object.__setattr__(config, "_traces", traces)
+    object.__setattr__(config, "_source", source)
+    dict.update(config, data)
+    return config
+
+
 class Config(dict):  # type:ignore[type-arg]
     """An attribute-based dict that can do smart merges.
 
@@ -229,9 +560,37 @@ class Config(dict):  # type:ignore[type-arg]
 
     """
 
-    def __init__(self, *args: t.Any, **kwds: t.Any) -> None:
+    def __init__(
+        self, *args: t.Any, source: str | None = SOURCE_UNKNOWN, **kwds: t.Any
+    ) -> None:
+        object.__setattr__(self, "_traces", {})
+        object.__setattr__(self, "_source", source)
         dict.__init__(self, *args, **kwds)
         self._ensure_subconfig()
+        self._adopt_initial_values()
+
+    def _adopt_initial_values(self) -> None:
+        """Record provenance for values supplied to the constructor.
+
+        Plain user-supplied values get the Config's source label
+        (``unknown`` by default). Nested Config sections keep their own
+        provenance; dict literals promoted to sections inherit this source.
+        """
+        traces = object.__getattribute__(self, "_traces")
+        source = object.__getattribute__(self, "_source")
+        for key, value in list(dict.items(self)):
+            if _is_section_key(key):
+                continue
+            traces[key] = self._trace_for_assignment(value, source)
+
+    @staticmethod
+    def _trace_for_assignment(
+        value: t.Any, source: str | None
+    ) -> _LeafTrace | None:
+        if isinstance(value, LazyConfigValue):
+            # the lazy object carries its own per-operation tags
+            return None
+        return _LeafTrace([SourceRecord(source or SOURCE_UNKNOWN, "set")])
 
     def _ensure_subconfig(self) -> None:
         """ensure that sub-dicts that should be Config objects are
@@ -239,10 +598,11 @@ class Config(dict):  # type:ignore[type-arg]
         casts dicts that are under section keys to Config objects,
         which is necessary for constructing Config objects from dict literals.
         """
+        source = object.__getattribute__(self, "_source")
         for key in self:
             obj = self[key]
             if _is_section_key(key) and isinstance(obj, dict) and not isinstance(obj, Config):
-                setattr(self, key, Config(obj))
+                dict.__setitem__(self, key, Config(obj, source=source))
 
     def _merge(self, other: t.Any) -> None:
         """deprecated alias, since traitlets 4.0 - 2015 use Config.merge()"""
@@ -259,20 +619,79 @@ class Config(dict):  # type:ignore[type-arg]
     def merge(self, other: t.Any) -> None:
         """merge another config object into this one"""
         to_update = {}
+        trace_updates = {}
         for k, v in other.items():
-            if k not in self:
+            incoming_trace = other._get_trace(k)
+            existing = dict.get(self, k)
+            # an auto-vivified empty LazyConfigValue is equivalent to
+            # a missing key for merge purposes
+            empty_lazy = (
+                isinstance(existing, LazyConfigValue)
+                and not (
+                    existing._extend
+                    or existing._prepend
+                    or existing._inserts
+                    or existing._update
+                )
+            )
+            if k not in self or empty_lazy:
                 to_update[k] = v
+                if incoming_trace is not None:
+                    trace_updates[k] = incoming_trace.copy()
+                elif isinstance(v, LazyConfigValue):
+                    trace_updates[k] = _lazy_trace(v)
+                if isinstance(v, Config):
+                    # Adopting a new section: keep the incoming leaf provenance,
+                    # but new values later written into this section originate
+                    # from the receiving config's source.
+                    own_source = object.__getattribute__(self, "_source")
+                    if own_source is not None:
+                        object.__setattr__(v, "_source", own_source)
             else:  # I have this key
                 if isinstance(v, Config) and isinstance(self[k], Config):
                     # Recursively merge common sub Configs
                     self[k].merge(v)
                 elif isinstance(v, LazyConfigValue):
-                    self[k] = v.merge_into(self[k])
+                    merged = v.merge_into(existing)
+                    own_trace = self._get_trace(k)
+                    if isinstance(merged, LazyConfigValue):
+                        lazy_incoming = incoming_trace or _lazy_trace(v)
+                        trace_updates[k] = _combine_traces(
+                            own_trace,
+                            lazy_incoming,
+                            incoming_is_lazy=True,
+                        )
+                    else:
+                        # reified now: align element sources with the result
+                        seed = (
+                            own_trace.clobbers[-1]
+                            if own_trace and own_trace.clobbers
+                            else None
+                        )
+                        _, element_sources = v.resolve(existing, seed)
+                        trace = _combine_traces(
+                            own_trace,
+                            incoming_trace or _lazy_trace(v),
+                            incoming_is_lazy=True,
+                        )
+                        if trace is not None and isinstance(
+                            element_sources, (list, dict)
+                        ):
+                            trace.element_sources = element_sources
+                        trace_updates[k] = trace
+                    dict.__setitem__(self, k, merged)
                 else:
                     # Plain updates for non-Configs
                     to_update[k] = v
+                    trace_updates[k] = _combine_traces(
+                        self._get_trace(k), incoming_trace
+                    )
 
-        self.update(to_update)
+        # plain value writes: bypass __setitem__ which would discard history
+        for k, v in to_update.items():
+            dict.__setitem__(self, k, v)
+        traces = object.__getattribute__(self, "_traces")
+        traces.update(trace_updates)
 
     def collisions(self, other: Config) -> dict[str, t.Any]:
         """Check for collisions between two config objects.
@@ -318,13 +737,20 @@ class Config(dict):  # type:ignore[type-arg]
         return _is_section_key(key) and key in self
 
     def copy(self) -> dict[str, t.Any]:
-        return type(self)(dict.copy(self))
+        new = type(self)(
+            dict.copy(self),
+            source=object.__getattribute__(self, "_source"),
+        )
+        # preserve full provenance history instead of re-adopting values
+        traces = object.__getattribute__(self, "_traces")
+        object.__setattr__(new, "_traces", {k: v.copy() for k, v in traces.items()})
+        return new
 
     def __copy__(self) -> dict[str, t.Any]:
         return self.copy()
 
     def __deepcopy__(self, memo: t.Any) -> Config:
-        new_config = type(self)()
+        new_config = type(self)(source=object.__getattribute__(self, "_source"))
         for key, value in self.items():
             if isinstance(value, (Config, LazyConfigValue)):
                 # deep copy config objects
@@ -333,19 +759,48 @@ class Config(dict):  # type:ignore[type-arg]
                 # shallow copy plain container traits
                 value = copy.copy(value)
             new_config[key] = value
+        traces = object.__getattribute__(self, "_traces")
+        object.__setattr__(
+            new_config,
+            "_traces",
+            {k: copy.deepcopy(v, memo) for k, v in traces.items()},
+        )
         return new_config
+
+    def _get_trace(self, key: str) -> _LeafTrace | None:
+        return object.__getattribute__(self, "_traces").get(key)
+
+    def _set_trace(self, key: str, trace: _LeafTrace | None) -> None:
+        if trace is None:
+            object.__getattribute__(self, "_traces").pop(key, None)
+        else:
+            object.__getattribute__(self, "_traces")[key] = trace
+
+    def __reduce__(self) -> tuple[t.Any, ...]:
+        # bypass the default dict-subclass reconstruction, which calls
+        # __setitem__ before provenance metadata is restored
+        return (
+            _reconstruct_config,
+            (
+                type(self),
+                dict(self),
+                object.__getattribute__(self, "_source"),
+                object.__getattribute__(self, "_traces"),
+            ),
+        )
 
     def __getitem__(self, key: str) -> t.Any:
         try:
             return dict.__getitem__(self, key)
         except KeyError:
+            source = object.__getattribute__(self, "_source") or SOURCE_UNKNOWN
             if _is_section_key(key):
-                c = Config()
+                c = Config(source=source)
                 dict.__setitem__(self, key, c)
                 return c
             elif not key.startswith("_"):
                 # undefined, create lazy value, used for container methods
-                v = LazyConfigValue()
+                v = LazyConfigValue(source=source)
                 dict.__setitem__(self, key, v)
                 return v
             else:
@@ -358,31 +813,64 @@ class Config(dict):  # type:ignore[type-arg]
                     "values whose keys begin with an uppercase "
                     f"char must be Config instances: {key!r}, {value!r}"
                 )
+        else:
+            source = object.__getattribute__(self, "_source")
+            self._set_trace(key, self._trace_for_assignment(value, source))
         dict.__setitem__(self, key, value)
 
     def __getattr__(self, key: str) -> t.Any:
-        if key.startswith("__"):
-            return dict.__getattr__(self, key)  # type:ignore[attr-defined]
+        if key.startswith("_"):
+            if key.startswith("__"):
+                raise AttributeError(key)
+            return object.__getattribute__(self, key)
         try:
             return self.__getitem__(key)
         except KeyError as e:
             raise AttributeError(e) from e
 
     def __setattr__(self, key: str, value: t.Any) -> None:
-        if key.startswith("__"):
-            return dict.__setattr__(self, key, value)
+        if key.startswith("_"):
+            if key.startswith("__"):
+                return dict.__setattr__(self, key, value)
+            return object.__setattr__(self, key, value)
         try:
             self.__setitem__(key, value)
         except KeyError as e:
             raise AttributeError(e) from e
 
     def __delattr__(self, key: str) -> None:
-        if key.startswith("__"):
-            return dict.__delattr__(self, key)
+        if key.startswith("_"):
+            if key.startswith("__"):
+                return dict.__delattr__(self, key)
+            object.__delattr__(self, key)
+            return
         try:
             dict.__delitem__(self, key)
+            self._set_trace(key, None)
         except KeyError as e:
             raise AttributeError(e) from e
+
+    def _walk_dotted(self, path: str) -> tuple[Config, str]:
+        """Walk a ``Section.Section.leaf`` dotted path without auto-vivifying."""
+        parts = path.split(".")
+        node = self
+        for part in parts[:-1]:
+            child = dict.get(node, part)
+            if not isinstance(child, Config):
+                raise KeyError(path)
+            node = child
+        return node, parts[-1]
+
+    def get_trace(self, path: str) -> _LeafTrace | None:
+        """Return the provenance trace for a dotted key, if any.
+
+        The trace only holds readable source labels and operation names,
+        never config values.
+        """
+        node, key = self._walk_dotted(path)
+        if not dict.__contains__(node, key):
+            return None
+        return node._get_trace(key)
 
 
 class DeferredConfig:
@@ -518,7 +1006,11 @@ class ConfigLoader:
             self.log = log
 
     def clear(self) -> None:
-        self.config = Config()
+        self.config = Config(source=self._source_label())
+
+    def _source_label(self) -> str:
+        """Readable provenance label for config produced by this loader."""
+        return SOURCE_UNKNOWN
 
     def load_config(self) -> Config:
         """Load a config from somewhere, return a :class:`Config` instance.
@@ -558,6 +1050,15 @@ class FileConfigLoader(ConfigLoader):
         """Try to find the file by searching the paths."""
         self.full_filename = filefind(self.filename, self.path)
 
+    def _source_label(self) -> str:
+        """Use the resolved file path as the provenance label.
+
+        Falls back to the requested filename before the file is located.
+        """
+        return getattr(self, "full_filename", "") or getattr(
+            self, "filename", SOURCE_UNKNOWN
+        )
+
 
 class JSONFileConfigLoader(FileConfigLoader):
     """A JSON file loader for config
@@ -579,7 +1080,7 @@ class JSONFileConfigLoader(FileConfigLoader):
         except OSError as e:
             raise ConfigFileNotFound(str(e)) from e
         dct = self._read_file_as_dict()
-        self.config = self._convert_to_config(dct)
+        self.config = self._convert_to_config(dct, source=self._source_label())
         return self.config
 
     def _read_file_as_dict(self) -> dict[str, t.Any]:
@@ -588,14 +1089,16 @@ class JSONFileConfigLoader(FileConfigLoader):
         with open(self.full_filename) as f:
             return t.cast("dict[str, t.Any]", json.load(f))
 
-    def _convert_to_config(self, dictionary: dict[str, t.Any]) -> Config:
+    def _convert_to_config(
+        self, dictionary: dict[str, t.Any], source: str = SOURCE_UNKNOWN
+    ) -> Config:
         if "version" in dictionary:
             version = dictionary.pop("version")
         else:
             version = 1
 
         if version == 1:
-            return Config(dictionary)
+            return Config(dictionary, source=source)
         else:
             raise ValueError(f"Unknown version of JSON config file: {version}")
 
@@ -652,20 +1155,40 @@ class PyFileConfigLoader(FileConfigLoader):
 
     def _read_file_as_dict(self) -> None:
         """Load the config file into self.config, with recursive loading."""
+        # Execute the file against a fresh Config labelled with this file.
+        # The provenance labels (and values) are then merged into self.config,
+        # keeping this file distinct from any recursively-loaded subconfigs.
+        file_config = Config(source=self._source_label())
+        loader = self
+
+        def load_subconfig(fname: str, path: str | None = None) -> None:
+            """load_subconfig injected into the config file namespace"""
+            if path is None:
+                path = loader.path
+            sub_loader = loader.__class__(fname, path)
+            try:
+                sub_config = sub_loader.load_config()
+            except ConfigFileNotFound:
+                # Pass silently if the sub config is not there,
+                # treat it as an empty config file.
+                pass
+            else:
+                file_config.merge(sub_config)
 
         def get_config() -> Config:
             """Unnecessary now, but a deprecation warning is more trouble than it's worth."""
-            return self.config
+            return file_config
 
         namespace = dict(  # noqa: C408
-            c=self.config,
-            load_subconfig=self.load_subconfig,
+            c=file_config,
+            load_subconfig=load_subconfig,
             get_config=get_config,
             __file__=self.full_filename,
         )
         conf_filename = self.full_filename
         with open(conf_filename, "rb") as f:
             exec(compile(f.read(), conf_filename, "exec"), namespace, namespace)  # noqa: S102
+        self.config.merge(file_config)
 
 
 class CommandLineConfigLoader(ConfigLoader):
@@ -674,6 +1197,9 @@ class CommandLineConfigLoader(ConfigLoader):
     As we add more command line based loaders, the common logic should go
     here.
     """
+
+    def _source_label(self) -> str:
+        return SOURCE_COMMAND_LINE
 
     def _exec_config_str(
         self, lhs: t.Any, rhs: t.Any, trait: TraitType[t.Any, t.Any] | None = None
@@ -710,7 +1236,9 @@ class CommandLineConfigLoader(ConfigLoader):
             # don't clobber whole config sections, update
             # each section from config:
             for sec, c in cfg.items():
-                self.config[sec].update(c)
+                section = self.config[sec]
+                for key, value in c.items():
+                    section[key] = value
         else:
             raise TypeError(f"Invalid flag: {cfg!r}")
 
