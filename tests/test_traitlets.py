@@ -45,6 +45,8 @@ from traitlets import (
     Long,
     MetaHasTraits,
     ObjectName,
+    ObservableDict,
+    ObservableList,
     Path,
     Set,
     TCPAddress,
@@ -1984,6 +1986,165 @@ def test_dict_default_value():
     assert foo.d1 == {}
     assert foo.d2 == {}
     assert foo.d1 is not foo.d2
+
+
+class ObservableListContainer(HasTraits):
+    values = ObservableList(Int())
+
+
+class ObservableDictContainer(HasTraits):
+    values = ObservableDict(value_trait=Int())
+
+
+def test_observable_container_hold_rolls_back_batch_mutations():
+    obj = ObservableListContainer()
+    obj.values.extend([1])
+    changes = []
+    obj.observe(changes.append, "values")
+
+    with pytest.raises(TraitError):
+        with obj.hold_trait_notifications():
+            obj.values.append(2)
+            obj.values.append("invalid")
+
+    assert obj.values == [1]
+    assert changes == []
+
+
+def test_plain_containers_do_not_notify_for_in_place_mutations():
+    class Container(HasTraits):
+        values = List()
+        mappings = Dict()
+
+    obj = Container()
+    changes = []
+    obj.observe(changes.append, "values")
+    obj.observe(changes.append, "mappings")
+
+    obj.values.append(1)
+    obj.mappings["key"] = "value"
+
+    assert changes == []
+
+
+def test_observable_list_notifies_in_place_mutations():
+    obj = ObservableListContainer()
+    changes = []
+    obj.observe(changes.append, "values")
+
+    obj.values.append(1)
+    obj.values.extend([2, 3])
+
+    assert obj.values == [1, 2, 3]
+    assert [(change.operation, change.index, change.new_value) for change in changes] == [
+        ("append", 0, 1),
+        ("extend", slice(1, 3), [2, 3]),
+    ]
+    assert changes[0].new is obj.values
+
+
+def test_observable_list_invalid_slice_replacement_is_atomic():
+    obj = ObservableListContainer()
+    obj.values.extend([1, 2])
+    changes = []
+    obj.observe(changes.append, "values")
+
+    with pytest.raises(TraitError):
+        obj.values[1:2] = [3, "invalid"]
+
+    assert obj.values == [1, 2]
+    assert changes == []
+
+
+def test_observable_container_owner_transfer_does_not_notify_old_owner():
+    old_owner = ObservableListContainer()
+    new_owner = ObservableListContainer()
+    old_owner.values.extend([1])
+    values = old_owner.values
+    old_changes = []
+    new_changes = []
+    old_owner.observe(old_changes.append, "values")
+    new_owner.observe(new_changes.append, "values")
+
+    new_owner.values = values
+    values.append(2)
+
+    assert old_changes == []
+    assert len(new_changes) == 2
+    assert "operation" not in new_changes[0]
+    assert new_changes[1].operation == "append"
+    assert new_owner.values is values
+
+
+def test_observable_dict_update_is_atomic():
+    obj = ObservableDictContainer()
+    changes = []
+    obj.observe(changes.append, "values")
+
+    with pytest.raises(TraitError):
+        obj.values.update({"a": 1, "b": "invalid"})
+
+    assert obj.values == {}
+    assert changes == []
+
+
+def test_observable_containers_recurse_only_when_enabled():
+    class RecursiveContainer(HasTraits):
+        values = ObservableList(recursive=True)
+
+    obj = RecursiveContainer()
+    changes = []
+    obj.observe(changes.append, "values")
+
+    obj.values.append([1])
+    obj.values[0].append(2)
+
+    assert obj.values == [[1, 2]]
+    assert changes[-1].path == (0,)
+    assert changes[-1].operation == "append"
+    assert changes[-1].new_value == 2
+
+    class FlatContainer(HasTraits):
+        values = ObservableList(recursive=False)
+
+    flat = FlatContainer()
+    flat.values.append([1])
+    flat.values[0].append(2)
+    assert type(flat.values[0]) is list
+
+
+def test_observable_dict_recursive_nested_notification():
+    class RecursiveContainer(HasTraits):
+        values = ObservableDict(recursive=True)
+
+    obj = RecursiveContainer()
+    changes = []
+    obj.observe(changes.append, "values")
+
+    obj.values["child"] = {}
+    obj.values["child"]["key"] = "value"
+
+    assert changes[-1].path == ("child",)
+    assert changes[-1].key == "key"
+    assert changes[-1].new_value == "value"
+
+
+def test_observable_container_hold_merges_events():
+    obj = ObservableDictContainer()
+    changes = []
+    obj.observe(changes.append, "values")
+
+    with obj.hold_trait_notifications():
+        obj.values["a"] = 1
+        obj.values["b"] = 2
+
+    assert len(changes) == 1
+    assert changes[0].operation == "batch"
+    operations = [
+        (change.operation, change.key, change.new_value)
+        for change in changes[0].operations
+    ]
+    assert operations == [("insert", "a", 1), ("insert", "b", 2)]
 
 
 class TestValidationHook(TestCase):

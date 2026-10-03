@@ -49,6 +49,7 @@ import re
 import sys
 import types
 import typing as t
+import weakref
 
 from .utils.bunch import Bunch
 from .utils.descriptions import add_article, class_of, describe, repr_type
@@ -107,6 +108,8 @@ __all__ = [
     "MetaHasDescriptors",
     "MetaHasTraits",
     "ObjectName",
+    "ObservableDict",
+    "ObservableList",
     "ObserveHandler",
     "Path",
     "Set",
@@ -1509,13 +1512,49 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                 """Merges the provided change with the last if possible."""
                 if past_changes is None:
                     return [change]
-                else:
-                    if past_changes[-1]["type"] == "change" and change.type == "change":
-                        past_changes[-1]["new"] = change.new
-                    else:
-                        # In case of changes other than 'change', append the notification.
-                        past_changes.append(change)
+                previous = past_changes[-1]
+                if previous.type != "change" or change.type != "change":
+                    past_changes.append(change)
                     return past_changes
+                if "operation" not in previous and "operation" not in change:
+                    previous["new"] = change.new
+                    return past_changes
+                if "operation" not in change and previous.new is not change.new:
+                    past_changes.append(change)
+                    return past_changes
+                if "operation" in previous and previous.get("operation") != "batch":
+                    if previous.new is not change.new:
+                        past_changes.append(change)
+                        return past_changes
+                    previous = Bunch(
+                        name=previous.name,
+                        old=previous.old,
+                        new=previous.new,
+                        owner=previous.owner,
+                        type="change",
+                        operation="batch",
+                        action="batch",
+                        location=None,
+                        path=(),
+                        index=None,
+                        key=None,
+                        old_value=None,
+                        new_value=None,
+                        old_state=previous.get("_rollback_state"),
+                        operations=[previous],
+                    )
+                    past_changes[-1] = previous
+                if previous.get("operation") == "batch":
+                    if "operation" not in change or previous.new is not change.new:
+                        past_changes.append(change)
+                        return past_changes
+                    if previous.get("old_state") is None and change.get("_rollback_state") is not None:
+                        previous["old_state"] = change.get("_rollback_state")
+                    previous.operations.append(change)
+                    previous["new"] = change.new
+                else:
+                    past_changes.append(change)
+                return past_changes
 
             def hold(change: Bunch) -> None:
                 name = change.name
@@ -1530,7 +1569,12 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                 # Cross validate final values when context is released.
                 for name in list(cache.keys()):
                     trait = getattr(self.__class__, name)
-                    value = trait._cross_validate(self, getattr(self, name))
+                    value = getattr(self, name)
+                    if isinstance(trait, (ObservableList, ObservableDict)) and isinstance(
+                        value, _ObservableContainerBase
+                    ):
+                        trait.validate(self, value)
+                    value = trait._cross_validate(self, value)
                     self.set_trait(name, value)
             except TraitError:
                 # Roll back in case of TraitError during final cross validation.
@@ -1539,7 +1583,16 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                     for change in changes[::-1]:
                         # TODO: Separate in a rollback function per notification type.
                         if change.type == "change":
-                            if change.old is not Undefined:
+                            if (
+                                change.get("operation") == "batch"
+                                and isinstance(change.new, _ObservableContainerBase)
+                            ):
+                                change.new._trait_replace_snapshot(change["old_state"])
+                            elif isinstance(change.new, _ObservableContainerBase) and isinstance(
+                                change.old, _ObservableContainerBase
+                            ) and change.new is change.old:
+                                change.new._trait_replace_snapshot(change["_rollback_state"])
+                            elif change.old is not Undefined:
                                 self.set_trait(name, change.old)
                             else:
                                 self._trait_values.pop(name)
@@ -3382,6 +3435,765 @@ class FuzzyEnum(Enum[G]):
         return self._info(as_rst=True)
 
 
+def _observable_is_proxy(value: t.Any) -> bool:
+    return isinstance(value, _ObservableContainerBase)
+
+
+def _observable_validate_scalar(trait: t.Any, obj: t.Any, value: t.Any) -> t.Any:
+    if trait is None or isinstance(trait, Any):
+        return value
+    try:
+        return trait.validate(obj, value)
+    except TraitError as error:
+        trait.error(obj, value, error)
+
+
+class _ObservableContainerBase:
+    def __init__(
+        self,
+        iterable: t.Any = (),
+        /,
+        *,
+        owner: t.Any = None,
+        parent: t.Any = None,
+        name: str | int | None = None,
+        root_trait: t.Any = None,
+        container_trait: t.Any = None,
+        item_trait: t.Any = None,
+        key_trait: t.Any = None,
+        per_key_traits: t.Any = None,
+        recursive: bool = False,
+    ) -> None:
+        super().__init__(iterable)
+        self._trait_owner = weakref.ref(owner) if owner is not None else None
+        self._trait_parent = weakref.ref(parent) if parent is not None else None
+        self._trait_name = name
+        self._trait_root_trait = root_trait
+        self._trait_container_trait = container_trait
+        self._trait_item_trait = item_trait
+        self._trait_key_trait = key_trait
+        self._trait_per_key_traits = per_key_traits
+        self._trait_recursive = recursive
+
+    @property
+    def _trait_root(self) -> "_ObservableContainerBase | None":
+        node = self
+        while node._trait_parent is not None:
+            parent = node._trait_parent()
+            if parent is None or not _observable_is_proxy(parent):
+                return None
+            node = parent
+        return node
+
+    @property
+    def _trait_path(self) -> tuple[t.Any, ...]:
+        path: list[t.Any] = []
+        node: _ObservableContainerBase | None = self
+        while node is not None and node._trait_parent is not None:
+            parent_ref = node._trait_parent
+            parent = parent_ref() if parent_ref is not None else None
+            if not _observable_is_proxy(parent):
+                break
+            if isinstance(parent, _ObservableList):
+                identity = next(
+                    (
+                        index
+                        for index, item in enumerate(list.__iter__(parent))
+                        if item is node
+                    ),
+                    None,
+                )
+                if identity is not None:
+                    path.append(identity)
+            elif node._trait_name is not None:
+                path.append(node._trait_name)
+            node = parent
+        return tuple(reversed(path))
+
+    def _trait_set_parent(
+        self,
+        parent: "_ObservableContainerBase",
+        name: str | int,
+        owner: t.Any | None = None,
+    ) -> None:
+        self._trait_owner = weakref.ref(owner) if owner is not None else parent._trait_owner
+        self._trait_parent = weakref.ref(parent)
+        self._trait_name = name
+        parent_root = parent._trait_root
+        self._trait_root_trait = (
+            parent_root._trait_root_trait if parent_root is not None else parent._trait_root_trait
+        )
+        self._trait_recursive = parent._trait_recursive
+
+    def _trait_clear_parent(self) -> None:
+        self._trait_owner = None
+        self._trait_parent = None
+        self._trait_name = None
+        self._trait_root_trait = None
+
+    def _trait_adopt(
+        self,
+        parent: "_ObservableContainerBase",
+        name: str | int,
+        item_trait: t.Any = None,
+    ) -> None:
+        self._trait_detach()
+        self._trait_set_parent(parent, name)
+        if isinstance(self, _ObservableList):
+            child_item_trait = getattr(item_trait, "_trait", None)
+            self._trait_container_trait = (
+                item_trait if isinstance(item_trait, ObservableList) else None
+            )
+            self._trait_item_trait = child_item_trait
+            self._trait_key_trait = None
+            self._trait_per_key_traits = None
+        elif isinstance(self, _ObservableDict):
+            self._trait_container_trait = (
+                item_trait if isinstance(item_trait, ObservableDict) else None
+            )
+            self._trait_item_trait = getattr(item_trait, "_value_trait", None)
+            self._trait_key_trait = getattr(item_trait, "_key_trait", None)
+            self._trait_per_key_traits = getattr(item_trait, "_per_key_traits", None)
+        self._trait_attach_children()
+
+    def _trait_detach(self) -> None:
+        self._trait_clear_parent()
+        for child in self._trait_children():
+            child._trait_detach()
+
+    def _trait_attach(
+        self,
+        owner: HasTraits,
+        root_trait: TraitType[t.Any, t.Any],
+        recursive: bool,
+    ) -> None:
+        self._trait_owner = weakref.ref(owner)
+        self._trait_parent = None
+        self._trait_name = None
+        self._trait_root_trait = root_trait
+        self._trait_container_trait = root_trait
+        self._trait_item_trait = getattr(root_trait, "_trait", None)
+        self._trait_key_trait = getattr(root_trait, "_key_trait", None)
+        self._trait_per_key_traits = getattr(root_trait, "_per_key_traits", None)
+        self._trait_recursive = recursive
+        self._trait_attach_children()
+
+    def _trait_attach_children(self) -> None:
+        raise NotImplementedError
+
+    def _trait_children(self) -> list["_ObservableContainerBase"]:
+        return [value for value in self._trait_values() if _observable_is_proxy(value)]
+
+    def _trait_release(self, values: t.Iterable[t.Any], kept: t.Iterable[t.Any] = ()) -> None:
+        retained = {id(value) for value in kept if _observable_is_proxy(value)}
+        for value in values:
+            if _observable_is_proxy(value) and id(value) not in retained:
+                value._trait_detach()
+
+    def _trait_values(self) -> t.Iterable[t.Any]:
+        raise NotImplementedError
+
+    def _trait_notify(
+        self,
+        operation: str,
+        location: t.Any = None,
+        old: t.Any = None,
+        new: t.Any = None,
+        action: str | None = None,
+        old_state: t.Any = None,
+    ) -> None:
+        root = self._trait_root
+        if root is None or root._trait_owner is None:
+            return
+        owner = root._trait_owner()
+        root_trait = root._trait_root_trait
+        if owner is None or root_trait is None or root_trait.name is None:
+            return
+        owner.notify_change(
+            Bunch(
+                name=root_trait.name,
+                old=root,
+                new=root,
+                owner=owner,
+                type="change",
+                operation=operation,
+                action=action or operation,
+                location=location,
+                path=self._trait_path,
+                index=location,
+                key=location,
+                old_value=old,
+                new_value=new,
+                _rollback_state=old_state,
+            )
+        )
+
+    def _trait_mutate(
+        self,
+        mutation: t.Callable[[], None],
+        operation: str,
+        location: t.Any = None,
+        old: t.Any = None,
+        new: t.Any = None,
+        action: str | None = None,
+        commit: t.Callable[[], None] | None = None,
+    ) -> None:
+        root = self._trait_root
+        if root is None or root._trait_owner is None or root._trait_root_trait is None:
+            mutation()
+            return
+        snapshot = root._trait_snapshot()
+        mutation()
+        owner = root._trait_owner()
+        if owner is None:
+            return
+        candidate = root._trait_candidate_for_validation()
+        try:
+            root._trait_root_trait.validate(owner, candidate)
+        except Exception:
+            root._trait_replace_snapshot(snapshot)
+            raise
+        if commit is not None:
+            commit()
+        self._trait_notify(operation, location, old, new, action, snapshot)
+
+    def _trait_snapshot(self) -> t.Any:
+        raise NotImplementedError
+
+    def _trait_replace_snapshot(self, snapshot: t.Any) -> None:
+        self._trait_replace_raw(snapshot, attach=True)
+
+    def _trait_replace_raw(self, value: t.Any, attach: bool = True) -> None:
+        raise NotImplementedError
+
+    def _trait_candidate_for_validation(self) -> t.Any:
+        raise NotImplementedError
+
+    def _trait_reject_aliases(self, obj: t.Any, values: t.Iterable[t.Any]) -> None:
+        seen: set[int] = set()
+        for value in values:
+            if not _observable_is_proxy(value):
+                continue
+            identity = id(value)
+            if identity in seen:
+                raise TraitError(
+                    f"The observable container {value!r} cannot be used more than once."
+                )
+            seen.add(identity)
+
+
+class _ObservableList(_ObservableContainerBase, list):
+    def _trait_values(self) -> t.Iterable[t.Any]:
+        return list.__iter__(self)
+
+    def _trait_children(self) -> list[_ObservableContainerBase]:
+        return [value for value in list.__iter__(self) if _observable_is_proxy(value)]
+
+    def _trait_attach_children(self) -> None:
+        self._trait_replace_raw(list(self), attach=True)
+
+    def _trait_snapshot(self) -> list[t.Any]:
+        return list(list.__iter__(self))
+
+    def _trait_replace_raw(self, value: t.Any, attach: bool = True) -> None:
+        old_children = self._trait_children()
+        list.__setitem__(self, slice(None), [])
+        for child in old_children:
+            child._trait_detach()
+        for index, item in enumerate(value):
+            child = self._trait_prepare_child(item, index) if attach else item
+            list.append(self, child)
+
+    def _trait_candidate_for_validation(self) -> list[t.Any]:
+        assert isinstance(self._trait_root_trait, ObservableList)
+        return self._trait_root_trait.validate_elements(self._trait_owner(), self._trait_snapshot())
+
+    def _trait_child_traits(self) -> tuple[t.Any, t.Any]:
+        if isinstance(self._trait_container_trait, ObservableList):
+            return self._trait_container_trait._trait, None
+        if isinstance(self._trait_container_trait, ObservableDict):
+            return self._trait_container_trait._value_trait, None
+        return self._trait_item_trait, None
+
+    def _trait_prepare_child(self, value: t.Any, index: int) -> t.Any:
+        item_trait, _ = self._trait_child_traits()
+        if _observable_is_proxy(value):
+            value._trait_adopt(self, index, item_trait)
+            return value
+        return self._trait_wrap_child(value, index, item_trait)
+
+    def _trait_wrap_child(self, value: t.Any, index: int, item_trait: t.Any) -> t.Any:
+        if self._trait_recursive and isinstance(value, list):
+            proxy = _ObservableList(value)
+            proxy._trait_adopt(self, index, item_trait)
+            return proxy
+        if self._trait_recursive and isinstance(value, dict):
+            proxy = _ObservableDict(value)
+            proxy._trait_adopt(self, index, item_trait)
+            return proxy
+        return value
+
+    def _trait_new_child(self, value: t.Any, item_trait: t.Any) -> t.Any:
+        if _observable_is_proxy(value):
+            return value
+        if self._trait_recursive and isinstance(value, list):
+            return _ObservableList(value)
+        if self._trait_recursive and isinstance(value, dict):
+            return _ObservableDict(value)
+        return value
+
+    def _trait_validate_candidate(self, value: t.Any, index: int) -> t.Any:
+        item_trait, _ = self._trait_child_traits()
+        if _observable_is_proxy(value):
+            if isinstance(item_trait, (ObservableList, ObservableDict)):
+                item_trait.validate(self._trait_owner(), value._trait_snapshot())
+            elif item_trait is not None and not isinstance(item_trait, Any):
+                item_trait.error(self._trait_owner(), value)
+        elif item_trait is not None and not isinstance(item_trait, Any):
+            value = _observable_validate_scalar(item_trait, self._trait_owner(), value)
+        return self._trait_new_child(value, item_trait)
+
+
+    def __getitem__(self, index: t.Any) -> t.Any:
+        value = list.__getitem__(self, index)
+        if isinstance(index, slice):
+            return list(value)
+        return value
+
+    def append(self, value: t.Any) -> None:
+        index = len(self)
+        value = self._trait_validate_candidate(value, index)
+        self._trait_reject_aliases(self._trait_owner(), list(self) + [value])
+
+        def mutate() -> None:
+            list.append(self, value)
+
+        def commit() -> None:
+            list.__setitem__(self, index, self._trait_prepare_child(value, index))
+
+        self._trait_mutate(mutate, "append", index, None, value, "insert", commit)
+
+    def extend(self, values: t.Iterable[t.Any]) -> None:
+        start = len(self)
+        new_values = list(values)
+        prepared = [
+            self._trait_validate_candidate(value, start + index)
+            for index, value in enumerate(new_values)
+        ]
+        if not prepared:
+            return
+        self._trait_reject_aliases(self._trait_owner(), list(self) + prepared)
+
+        def mutate() -> None:
+            list.extend(self, prepared)
+
+        def commit() -> None:
+            for offset in range(len(prepared)):
+                position = start + offset
+                list.__setitem__(
+                    self,
+                    position,
+                    self._trait_prepare_child(list.__getitem__(self, position), position),
+                )
+
+        self._trait_mutate(
+            mutate,
+            "extend",
+            slice(start, start + len(prepared)),
+            None,
+            prepared,
+            "insert",
+            commit,
+        )
+
+    __iadd__ = extend  # type:ignore[assignment]
+
+    def insert(self, index: int, value: t.Any) -> None:
+        index = max(0, min(index, len(self)))
+        value = self._trait_validate_candidate(value, index)
+        replacement_values = list(self)
+        replacement_values.insert(index, value)
+        self._trait_reject_aliases(self._trait_owner(), replacement_values)
+
+        def mutate() -> None:
+            list.insert(self, index, value)
+
+        def commit() -> None:
+            list.__setitem__(self, index, self._trait_prepare_child(value, index))
+
+        self._trait_mutate(mutate, "insert", index, None, value, "insert", commit)
+
+    def remove(self, value: t.Any) -> None:
+        index = list.index(self, value)
+
+        def mutate() -> None:
+            list.remove(self, value)
+
+        def commit() -> None:
+            self._trait_release([value])
+
+        self._trait_mutate(mutate, "remove", index, value, None, "delete", commit)
+
+    def pop(self, index: int = -1) -> t.Any:
+        normalized = index if index >= 0 else len(self) + index
+        old_value = self[normalized]
+
+        def mutate() -> None:
+            list.pop(self, index)
+
+        def commit() -> None:
+            self._trait_release([old_value])
+
+        self._trait_mutate(mutate, "pop", normalized, old_value, None, "delete", commit)
+        return old_value
+
+    def clear(self) -> None:
+        old_values = list(list.__iter__(self))
+        if not old_values:
+            return
+
+        def mutate() -> None:
+            list.clear(self)
+
+        def commit() -> None:
+            self._trait_release(old_values)
+
+        self._trait_mutate(
+            mutate,
+            "clear",
+            slice(0, len(old_values)),
+            old_values,
+            None,
+            "delete",
+            commit,
+        )
+
+    def reverse(self) -> None:
+        def mutate() -> None:
+            list.reverse(self)
+
+        self._trait_mutate(mutate, "reverse", slice(None), None, None, "reorder")
+
+    def sort(self, /, *args: t.Any, **kwargs: t.Any) -> None:
+        def mutate() -> None:
+            list.sort(self, *args, **kwargs)
+
+        self._trait_mutate(mutate, "sort", slice(None), None, None, "reorder")
+
+    def __setitem__(self, index: t.Any, value: t.Any) -> None:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            old_values = list.__getitem__(self, index)
+            new_values = list(value)
+            if not old_values and not new_values:
+                return
+            prepared = [
+                self._trait_validate_candidate(item, start + offset)
+                for offset, item in enumerate(new_values)
+            ]
+            selected_indices = range(start, stop, step)
+            candidate = [
+                value
+                for position, value in enumerate(list.__iter__(self))
+                if position not in selected_indices
+            ]
+            candidate[start:start] = prepared
+            self._trait_reject_aliases(self._trait_owner(), candidate)
+            replacement = slice(start, start + len(prepared), step) if step == 1 else index
+
+            def mutate() -> None:
+                list.__setitem__(self, replacement, prepared)
+
+            def commit() -> None:
+                self._trait_release(old_values, prepared)
+                positions = range(start, start + len(prepared)) if step == 1 else range(start, stop, step)
+                for offset, position in enumerate(positions):
+                    list.__setitem__(
+                        self,
+                        position,
+                        self._trait_prepare_child(list.__getitem__(self, position), position),
+                    )
+
+            self._trait_mutate(mutate, "replace", index, old_values, prepared, "replace", commit)
+        else:
+            normalized = index if index >= 0 else len(self) + index
+            old_value = list.__getitem__(self, normalized)
+            value = self._trait_validate_candidate(value, normalized)
+            replacement_values = list(list.__iter__(self))
+            replacement_values[normalized] = value
+            self._trait_reject_aliases(self._trait_owner(), replacement_values)
+
+            def mutate() -> None:
+                list.__setitem__(self, normalized, value)
+
+            def commit() -> None:
+                self._trait_release([old_value], [value])
+                list.__setitem__(
+                    self,
+                    normalized,
+                    self._trait_prepare_child(value, normalized),
+                )
+
+            self._trait_mutate(mutate, "replace", normalized, old_value, value, "replace", commit)
+
+    def __delitem__(self, index: t.Any) -> None:
+        if isinstance(index, slice):
+            old_values = list.__getitem__(self, index)
+            location = index
+            if not old_values:
+                return
+
+            def mutate() -> None:
+                list.__delitem__(self, index)
+
+            def commit() -> None:
+                self._trait_release(old_values)
+        else:
+            normalized = index if index >= 0 else len(self) + index
+            old_values = list.__getitem__(self, normalized)
+            location = normalized
+
+            def mutate() -> None:
+                list.__delitem__(self, normalized)
+
+            def commit() -> None:
+                self._trait_release([old_values])
+
+        self._trait_mutate(mutate, "delete", location, old_values, None, "delete", commit)
+
+    def copy(self) -> list[t.Any]:
+        return self._trait_snapshot()
+
+
+class _ObservableDict(_ObservableContainerBase, dict):
+    def _trait_values(self) -> t.Iterable[t.Any]:
+        return dict.values(self)
+
+    def _trait_children(self) -> list[_ObservableContainerBase]:
+        return [value for value in dict.values(self) if _observable_is_proxy(value)]
+
+    def _trait_attach_children(self) -> None:
+        self._trait_replace_raw(dict(self), attach=True)
+
+    def _trait_snapshot(self) -> dict[t.Any, t.Any]:
+        return dict(self)
+
+    def _trait_replace_raw(self, value: t.Any, attach: bool = True) -> None:
+        old_children = self._trait_children()
+        dict.clear(self)
+        for child in old_children:
+            child._trait_detach()
+        for key, item in dict(value).items():
+            child = self._trait_prepare_child(item, key) if attach else item
+            dict.__setitem__(self, key, child)
+
+    def _trait_candidate_for_validation(self) -> dict[t.Any, t.Any]:
+        assert isinstance(self._trait_root_trait, ObservableDict)
+        return self._trait_root_trait.validate_elements(
+            self._trait_owner(),
+            self._trait_snapshot(),
+        )
+
+    def _trait_value_trait(self, key: t.Any) -> t.Any:
+        if isinstance(self._trait_container_trait, ObservableDict):
+            per_key = self._trait_container_trait._per_key_traits or {}
+            return per_key.get(key, self._trait_container_trait._value_trait)
+        per_key = self._trait_per_key_traits or {}
+        return per_key.get(key, self._trait_item_trait)
+
+    def _trait_prepare_child(self, value: t.Any, key: t.Any) -> t.Any:
+        value_trait = self._trait_value_trait(key)
+        if _observable_is_proxy(value):
+            value._trait_adopt(self, key, value_trait)
+            return value
+        return self._trait_wrap_child(value, key, value_trait)
+
+    def _trait_wrap_child(self, value: t.Any, key: t.Any, value_trait: t.Any) -> t.Any:
+        if self._trait_recursive and isinstance(value, list):
+            proxy = _ObservableList(value)
+            proxy._trait_adopt(self, key, value_trait)
+            return proxy
+        if self._trait_recursive and isinstance(value, dict):
+            proxy = _ObservableDict(value)
+            proxy._trait_adopt(self, key, value_trait)
+            return proxy
+        return value
+
+    def _trait_new_child(self, value: t.Any, value_trait: t.Any) -> t.Any:
+        if _observable_is_proxy(value):
+            return value
+        if self._trait_recursive and isinstance(value, list):
+            return _ObservableList(value)
+        if self._trait_recursive and isinstance(value, dict):
+            return _ObservableDict(value)
+        return value
+
+    def _trait_validate_key(self, key: t.Any) -> t.Any:
+        if self._trait_key_trait is not None and not isinstance(self._trait_key_trait, Any):
+            return _observable_validate_scalar(self._trait_key_trait, self._trait_owner(), key)
+        return key
+
+    def _trait_validate_candidate(self, value: t.Any, key: t.Any) -> t.Any:
+        value_trait = self._trait_value_trait(key)
+        if _observable_is_proxy(value):
+            if isinstance(value_trait, (ObservableList, ObservableDict)):
+                value_trait.validate(self._trait_owner(), value._trait_snapshot())
+            elif value_trait is not None and not isinstance(value_trait, Any):
+                value_trait.error(self._trait_owner(), value)
+        elif value_trait is not None and not isinstance(value_trait, Any):
+            value = _observable_validate_scalar(value_trait, self._trait_owner(), value)
+        return self._trait_new_child(value, value_trait)
+
+    def __setitem__(self, key: t.Any, value: t.Any) -> None:
+        old_present = key in self
+        old_value = dict.get(self, key)
+        key = self._trait_validate_key(key)
+        value = self._trait_validate_candidate(value, key)
+        final_values = dict(self)
+        final_values[key] = value
+        self._trait_reject_aliases(self._trait_owner(), final_values.values())
+
+        def mutate() -> None:
+            dict.__setitem__(self, key, value)
+
+        def commit() -> None:
+            self._trait_release([old_value], [value])
+            dict.__setitem__(self, key, self._trait_prepare_child(value, key))
+
+        self._trait_mutate(
+            mutate,
+            "set" if old_present else "insert",
+            key,
+            old_value if old_present else None,
+            value,
+            "replace" if old_present else "insert",
+            commit,
+        )
+
+    def __delitem__(self, key: t.Any) -> None:
+        old_value = dict.__getitem__(self, key)
+
+        def mutate() -> None:
+            dict.__delitem__(self, key)
+
+        def commit() -> None:
+            self._trait_release([old_value])
+
+        self._trait_mutate(mutate, "delete", key, old_value, None, "delete", commit)
+
+    def update(self, *args: t.Any, **kwargs: t.Any) -> None:
+        if len(args) > 1:
+            msg = f"update expected at most 1 argument, got {len(args)}"
+            raise TypeError(msg)
+        changes: dict[t.Any, t.Any] = {}
+        if args:
+            arg = args[0]
+            if hasattr(arg, "keys"):
+                changes.update({key: arg[key] for key in arg.keys()})
+            else:
+                changes.update(arg)
+        changes.update(kwargs)
+        prepared = {
+            self._trait_validate_key(key): self._trait_validate_candidate(value, key)
+            for key, value in changes.items()
+        }
+        if not prepared:
+            return
+        old_values = {key: dict.get(self, key) for key in prepared}
+        final_values = dict(self)
+        final_values.update(prepared)
+        self._trait_reject_aliases(self._trait_owner(), final_values.values())
+
+        def mutate() -> None:
+            for key, value in prepared.items():
+                dict.__setitem__(self, key, value)
+
+        def commit() -> None:
+            self._trait_release(old_values.values(), prepared.values())
+            for key, value in prepared.items():
+                dict.__setitem__(self, key, self._trait_prepare_child(value, key))
+
+        self._trait_mutate(
+            mutate,
+            "update",
+            list(prepared),
+            old_values,
+            prepared,
+            "update",
+            commit,
+        )
+
+    def setdefault(self, key: t.Any, default: t.Any = None) -> t.Any:
+        if key in self:
+            return dict.__getitem__(self, key)
+        key = self._trait_validate_key(key)
+        value = self._trait_validate_candidate(default, key)
+        final_values = dict(self)
+        final_values[key] = value
+        self._trait_reject_aliases(self._trait_owner(), final_values.values())
+
+        def mutate() -> None:
+            dict.__setitem__(self, key, value)
+
+        def commit() -> None:
+            dict.__setitem__(self, key, self._trait_prepare_child(value, key))
+
+        self._trait_mutate(mutate, "setdefault", key, None, value, "insert", commit)
+        return value
+
+    def pop(self, key: t.Any, /, default: t.Any = Undefined) -> t.Any:
+        if key in self:
+            old_value = dict.__getitem__(self, key)
+
+            def mutate() -> None:
+                dict.pop(self, key)
+
+            def commit() -> None:
+                self._trait_release([old_value])
+
+            self._trait_mutate(mutate, "pop", key, old_value, None, "delete", commit)
+            return old_value
+        if default is not Undefined:
+            return default
+        dict.__getitem__(self, key)
+
+    def popitem(self) -> tuple[t.Any, t.Any]:
+        key, old_value = next(iter(dict.items(self)))
+
+        def mutate() -> None:
+            dict.pop(self, key)
+
+        def commit() -> None:
+            self._trait_release([old_value])
+
+        self._trait_mutate(mutate, "popitem", key, old_value, None, "delete", commit)
+        return key, old_value
+
+    def clear(self) -> None:
+        old_values = dict(self)
+        if not old_values:
+            return
+
+        def mutate() -> None:
+            dict.clear(self)
+
+        def commit() -> None:
+            self._trait_release(old_values.values())
+
+        self._trait_mutate(
+            mutate,
+            "clear",
+            list(old_values),
+            old_values,
+            None,
+            "delete",
+            commit,
+        )
+
+    def copy(self) -> dict[t.Any, t.Any]:
+        return self._trait_snapshot()
+
+
 class Container(Instance[T]):
     """An instance of a container (list, set, etc.)
 
@@ -4149,6 +4961,270 @@ class Dict(Instance["dict[K, V]"]):
         if value_trait:
             value = value_trait.from_string(value)
         return {key: value}  # type:ignore[dict-item]
+
+
+class ObservableList(List[t.Any]):
+    """An opt-in list trait that notifies observers for in-place mutations.
+
+    The attribute value is a list proxy. Mutations such as ``append``,
+    insertion, deletion, slices and ``extend`` validate affected elements and
+    emit a change event containing ``operation`` and ``location``. Invalid
+    batch mutations are rolled back before notification.
+
+    Set ``recursive=True`` to observe nested lists and dictionaries. Nested
+    event objects identify the mutated subtree in ``path``. Assigning a proxy
+    to another owner detaches it from the previous owner, so later mutations
+    notify only the new owner. A detached proxy keeps its data and behaves as
+    a regular container until adopted by another owner. Events created inside
+    ``hold_trait_notifications`` are delivered as one ``batch`` event.
+    """
+
+    klass = _ObservableList  # type:ignore[assignment]
+
+    if t.TYPE_CHECKING:
+
+        @t.overload
+        def __init__(
+            self,
+            trait: list[t.Any] | tuple[t.Any] | set[t.Any] | TraitType[t.Any, t.Any] | None = None,
+            default_value: t.Any = Undefined,
+            *args: t.Any,
+            recursive: bool = False,
+            minlen: int = 0,
+            maxlen: int = sys.maxsize,
+            **kwargs: t.Any,
+        ) -> None: ...
+
+        def __init__(
+            self,
+            trait: t.Any = None,
+            default_value: t.Any = Undefined,
+            *args: t.Any,
+            recursive: bool = False,
+            **kwargs: t.Any,
+        ) -> None: ...
+
+    else:
+
+        def __init__(self, *args: t.Any, recursive: bool = False, **kwargs: t.Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._recursive = recursive
+
+    def _bind(self, obj: HasTraits, value: _ObservableList) -> _ObservableList:
+        value._trait_attach(obj, self, self._recursive)
+        return value
+
+    def _wrap_validated(self, obj: HasTraits, value: t.Any) -> _ObservableList | None:
+        if value is None:
+            return None
+        if isinstance(value, _ObservableList):
+            return value
+        validated = self.validate(obj, tuple(value) if isinstance(value, tuple) else value)
+        assert validated is not None
+        return validated
+
+    def validate(self, obj: t.Any, value: t.Any) -> _ObservableList | None:
+        if value is None and self.allow_none:
+            return None
+        if isinstance(value, _ObservableList):
+            self._validate_proxy_elements(obj, value)
+            return value
+        if isinstance(value, tuple):
+            value = list(value)
+        if not isinstance(value, list):
+            self.error(obj, value)
+        value = self.validate_elements(obj, value)
+        return _ObservableList(value)
+
+    def _validate_proxy_elements(self, obj: t.Any, value: _ObservableList) -> None:
+        length = len(value)
+        if length < self._minlen or length > self._maxlen:
+            self.length_error(obj, value)
+        if self._trait is None or isinstance(self._trait, Any):
+            return
+        for item in value:
+            if _observable_is_proxy(item):
+                if isinstance(item, _ObservableList):
+                    if not isinstance(self._trait, ObservableList):
+                        self.error(obj, item)
+                    self._trait.validate(obj, item)
+                elif isinstance(item, _ObservableDict):
+                    if not isinstance(self._trait, ObservableDict):
+                        self.error(obj, item)
+                    self._trait.validate(obj, item)
+            else:
+                try:
+                    self._trait.validate(obj, item)
+                except TraitError as error:
+                    self.error(obj, item, error)
+
+    def get(self, obj: HasTraits, cls: type[t.Any] | None = None) -> _ObservableList | None:
+        assert self.name is not None
+        try:
+            return obj._trait_values[self.name]
+        except KeyError:
+            default = obj.trait_defaults(self.name)
+            value = self._wrap_validated(obj, self._validate(obj, default))
+            if value is not None:
+                self._bind(obj, value)
+            obj._trait_values[self.name] = value
+            obj._notify_observers(Bunch(name=self.name, value=value, owner=obj, type="default"))
+            return value
+
+    def set(self, obj: HasTraits, value: t.Any) -> None:
+        if isinstance(value, str):
+            value = [value]
+        new_value = self._validate(obj, value)
+        new_value = self._wrap_validated(obj, new_value)
+        if new_value is not None:
+            self._bind(obj, new_value)
+        assert self.name is not None
+        try:
+            old_value = obj._trait_values[self.name]
+        except KeyError:
+            old_value = self.default_value
+        if isinstance(old_value, _ObservableContainerBase) and old_value is not new_value:
+            old_value._trait_detach()
+        obj._trait_values[self.name] = new_value
+        try:
+            silent = bool(old_value == new_value)
+        except Exception:
+            silent = False
+        if silent is not True:
+            obj._notify_trait(self.name, old_value, new_value)
+
+
+class ObservableDict(Dict):
+    """An opt-in dict trait that notifies observers for in-place mutations.
+
+    The attribute value is a dict proxy. Item insertion, replacement,
+    deletion and ``update`` validate affected keys and values and emit a
+    change event containing ``operation`` and ``key``. An invalid ``update``
+    is rolled back before notification.
+
+    Set ``recursive=True`` to observe nested lists and dictionaries. Nested
+    event objects identify the mutated subtree in ``path``. Assigning a proxy
+    to another owner detaches it from the previous owner, so later mutations
+    notify only the new owner. A detached proxy keeps its data and behaves as
+    a regular container until adopted by another owner. Events created inside
+    ``hold_trait_notifications`` are delivered as one ``batch`` event.
+    """
+
+    klass = _ObservableDict  # type:ignore[assignment]
+
+    if t.TYPE_CHECKING:
+
+        @t.overload
+        def __init__(
+            self,
+            value_trait: t.Any = None,
+            per_key_traits: t.Any = None,
+            key_trait: t.Any = None,
+            default_value: t.Any = Undefined,
+            *args: t.Any,
+            recursive: bool = False,
+            **kwargs: t.Any,
+        ) -> None: ...
+
+        def __init__(
+            self,
+            value_trait: t.Any = None,
+            per_key_traits: t.Any = None,
+            key_trait: t.Any = None,
+            default_value: t.Any = Undefined,
+            *args: t.Any,
+            recursive: bool = False,
+            **kwargs: t.Any,
+        ) -> None: ...
+
+    else:
+
+        def __init__(self, *args: t.Any, recursive: bool = False, **kwargs: t.Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._recursive = recursive
+
+    def _bind(self, obj: HasTraits, value: _ObservableDict) -> _ObservableDict:
+        value._trait_attach(obj, self, self._recursive)
+        return value
+
+    def _wrap_validated(self, obj: HasTraits, value: t.Any) -> _ObservableDict | None:
+        if value is None:
+            return None
+        if isinstance(value, _ObservableDict):
+            return value
+        validated = self.validate(obj, value)
+        assert validated is not None
+        return validated
+
+    def validate(self, obj: t.Any, value: t.Any) -> _ObservableDict | None:
+        if value is None and self.allow_none:
+            return None
+        if isinstance(value, _ObservableDict):
+            self._validate_proxy_elements(obj, value)
+            return value
+        if not isinstance(value, dict):
+            self.error(obj, value)
+        value = self.validate_elements(obj, value)
+        return _ObservableDict(value)
+
+    def _validate_proxy_elements(self, obj: t.Any, value: _ObservableDict) -> None:
+        for key, item in value.items():
+            validated_key = key
+            if self._key_trait is not None:
+                try:
+                    validated_key = self._key_trait.validate(obj, key)
+                except TraitError:
+                    self.element_error(obj, key, self._key_trait, "Keys")
+            value_trait = (self._per_key_traits or {}).get(validated_key, self._value_trait)
+            if value_trait is None:
+                continue
+            if _observable_is_proxy(item):
+                if isinstance(item, _ObservableList):
+                    if not isinstance(value_trait, ObservableList):
+                        self.error(obj, item)
+                    value_trait.validate(obj, item)
+                elif isinstance(item, _ObservableDict):
+                    if not isinstance(value_trait, ObservableDict):
+                        self.error(obj, item)
+                    value_trait.validate(obj, item)
+            else:
+                try:
+                    value_trait.validate(obj, item)
+                except TraitError:
+                    self.element_error(obj, item, value_trait, "Values")
+
+    def get(self, obj: HasTraits, cls: type[t.Any] | None = None) -> _ObservableDict | None:
+        assert self.name is not None
+        try:
+            return obj._trait_values[self.name]
+        except KeyError:
+            default = obj.trait_defaults(self.name)
+            value = self._wrap_validated(obj, self._validate(obj, default))
+            if value is not None:
+                self._bind(obj, value)
+            obj._trait_values[self.name] = value
+            obj._notify_observers(Bunch(name=self.name, value=value, owner=obj, type="default"))
+            return value
+
+    def set(self, obj: HasTraits, value: t.Any) -> None:
+        new_value = self._validate(obj, value)
+        new_value = self._wrap_validated(obj, new_value)
+        if new_value is not None:
+            self._bind(obj, new_value)
+        assert self.name is not None
+        try:
+            old_value = obj._trait_values[self.name]
+        except KeyError:
+            old_value = self.default_value
+        if isinstance(old_value, _ObservableContainerBase) and old_value is not new_value:
+            old_value._trait_detach()
+        obj._trait_values[self.name] = new_value
+        try:
+            silent = bool(old_value == new_value)
+        except Exception:
+            silent = False
+        if silent is not True:
+            obj._notify_trait(self.name, old_value, new_value)
 
 
 class TCPAddress(TraitType[G, S]):

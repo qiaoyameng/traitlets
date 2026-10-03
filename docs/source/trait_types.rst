@@ -84,6 +84,12 @@ Containers
 .. autoclass:: Dict
    :members: __init__, from_string_list, item_from_string
 
+.. autoclass:: ObservableList
+   :members: __init__
+
+.. autoclass:: ObservableDict
+   :members: __init__
+
 Classes and instances
 ---------------------
 
