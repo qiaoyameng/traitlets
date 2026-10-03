@@ -42,11 +42,13 @@ Inheritance diagram:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import enum
 import numbers
 import os
 import re
 import sys
+import threading
 import types
 import typing as t
 
@@ -102,6 +104,9 @@ __all__ = [
     "Instance",
     "Int",
     "Integer",
+    "LinkCycleError",
+    "LinkDiagnostics",
+    "LinkPropagationDiagnostics",
     "List",
     "Long",
     "MetaHasDescriptors",
@@ -184,6 +189,191 @@ def __dir__() -> list[str]:
 
 class TraitError(Exception):
     pass
+
+
+def _link_endpoint_id(endpoint: t.Any) -> str:
+    obj, trait_name = endpoint
+    return f"{type(obj).__name__}@0x{id(obj):x}.{trait_name}"
+
+
+def _link_edge_step(target: t.Any, direction: str) -> str:
+    return f"{direction} {_link_endpoint_id(target)}"
+
+
+def _link_values_equal(left: t.Any, right: t.Any) -> bool:
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+@dataclasses.dataclass
+class _LinkTrace:
+    nodes: list[t.Any]
+    path: list[t.Any]
+    steps: int
+    edges: list[tuple[t.Any, t.Any, str]]
+    directions: list[str]
+    detect: bool
+
+
+class LinkCycleError(TraitError):
+    """Raised when linked trait propagation visits a trait more than once.
+
+    ``path`` contains the repeated endpoint, while ``edges`` and
+    ``directions`` retain the direction of each transform in the propagation.
+    ``cycle_path`` is a readable representation of that route.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        path: t.Sequence[t.Any],
+        *,
+        edges: t.Sequence[tuple[t.Any, t.Any, str]] | None = None,
+        directions: t.Sequence[str] | None = None,
+        steps: int,
+        max_steps: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.path = tuple(path)
+        self.edges = tuple(edges or ())
+        self.directions = tuple(directions or ())
+        self.steps = steps
+        self.max_steps = max_steps
+        if directions:
+            self.cycle_path = _link_endpoint_id(path[0])
+            self.cycle_path += " " + " ".join(
+                _link_edge_step(endpoint, direction)
+                for endpoint, direction in zip(path[1:], directions, strict=True)
+            )
+        else:
+            self.cycle_path = " -> ".join(_link_endpoint_id(endpoint) for endpoint in path)
+
+
+class _NullLinkPropagation:
+    enabled = False
+
+    @contextlib.contextmanager
+    def track(
+        self,
+        source: t.Any,
+        target: t.Any,
+        direction: str,
+        *,
+        detect: bool = True,
+        record: bool = True,
+    ) -> t.Iterator[None]:
+        yield
+
+
+class LinkPropagationDiagnostics:
+    """Track one synchronous chain of linked trait updates.
+
+    The same diagnostics instance can be passed to every link in a network.
+    State is kept in thread-local storage, so updates in separate threads do
+    not share a path.
+
+    Parameters
+    ----------
+    max_steps:
+        Maximum number of changing links allowed in one synchronous update
+        chain. A closed transform that changes a previously visited value is
+        reported sooner as a cycle.
+    """
+
+    enabled = True
+
+    def __init__(self, max_steps: int = 100) -> None:
+        if not isinstance(max_steps, int) or max_steps <= 0:
+            raise ValueError("max_steps must be a positive integer")
+        self.max_steps = max_steps
+        self._state = threading.local()
+
+    @property
+    def current_path(self) -> tuple[t.Any, ...] | None:
+        """Endpoints visited by the active synchronous propagation."""
+        trace: _LinkTrace | None = getattr(self._state, "trace", None)
+        if trace is None:
+            return None
+        return tuple(trace.path)
+
+    @contextlib.contextmanager
+    def track(
+        self,
+        source: t.Any,
+        target: t.Any,
+        direction: str,
+        *,
+        detect: bool = True,
+        record: bool = True,
+    ) -> t.Iterator[None]:
+        if not record:
+            yield
+            return
+
+        trace: _LinkTrace | None = getattr(self._state, "trace", None)
+        owns_trace = trace is None
+        if owns_trace:
+            trace = _LinkTrace([source], [source], 0, [], [], detect)
+            self._state.trace = trace
+        assert trace is not None
+
+        try:
+            effective_detect = detect and trace.detect
+            trace.edges.append((source, target, direction))
+            trace.directions.append(direction)
+            trace.path.append(target)
+            trace.steps += 1
+            cycle = effective_detect and target in trace.nodes
+            trace.nodes.append(target)
+
+            if cycle:
+                path = tuple(trace.path)
+                cycle_path = self._format_path(path, trace.directions)
+                message = (
+                    "Link propagation cycle detected after "
+                    f"{trace.steps} step(s): "
+                    f"{cycle_path}"
+                )
+                raise LinkCycleError(
+                    message,
+                    path,
+                    edges=trace.edges,
+                    directions=trace.directions,
+                    steps=trace.steps,
+                    max_steps=self.max_steps,
+                )
+            if effective_detect and trace.steps > self.max_steps:
+                path = tuple(trace.path)
+                cycle_path = self._format_path(path, trace.directions)
+                message = (
+                    f"Link propagation exceeded {self.max_steps} step(s); "
+                    "a transform may be preventing the links from converging: "
+                    f"{cycle_path}"
+                )
+                raise LinkCycleError(
+                    message,
+                    path,
+                    edges=trace.edges,
+                    directions=trace.directions,
+                    steps=trace.steps,
+                    max_steps=self.max_steps,
+                )
+            yield
+        finally:
+            if owns_trace:
+                self._state.trace = None
+
+    @staticmethod
+    def _format_path(path: t.Sequence[t.Any], directions: t.Sequence[str]) -> str:
+        return _link_endpoint_id(path[0]) + " " + " ".join(
+            _link_edge_step(endpoint, direction)
+            for endpoint, direction in zip(path[1:], directions, strict=True)
+        )
+
+
+LinkDiagnostics = LinkPropagationDiagnostics
 
 
 # -----------------------------------------------------------------------------
@@ -304,6 +494,9 @@ class link:
     target : (object / attribute name) pair
     transform: iterable with two callables (optional)
         Data transformation between source and target and target and source.
+    propagation_diagnostics: LinkPropagationDiagnostics, optional
+        Shared diagnostics used to detect an oscillating chain of links.
+        ``diagnostics`` is accepted as a shorter alias.
 
     Examples
     --------
@@ -323,10 +516,20 @@ class link:
     updating = False
 
     def __init__(
-        self, source: t.Any, target: t.Any, transform: t.Iterable[FuncT] | None = None
+        self,
+        source: t.Any,
+        target: t.Any,
+        transform: t.Iterable[FuncT] | None = None,
+        *,
+        diagnostics: LinkPropagationDiagnostics | None = None,
+        propagation_diagnostics: LinkPropagationDiagnostics | None = None,
     ) -> None:
         _validate_link(source, target)
         self.source, self.target = source, target
+        diagnostics = (
+            propagation_diagnostics if propagation_diagnostics is not None else diagnostics
+        )
+        self.diagnostics = diagnostics if diagnostics is not None else _NullLinkPropagation()
         if transform:
             self._transform, self._transform_inv = transform  # type:ignore[method-assign]
         self.link()
@@ -339,11 +542,12 @@ class link:
 
     def link(self) -> None:
         try:
-            setattr(
-                self.target[0],
-                self.target[1],
-                self._transform(getattr(self.source[0], self.source[1])),
-            )
+            new_value = self._transform(getattr(self.source[0], self.source[1]))
+            stable = _link_values_equal(getattr(self.target[0], self.target[1]), new_value)
+            with self.diagnostics.track(
+                self.source, self.target, "->", detect=False, record=not stable
+            ):
+                setattr(self.target[0], self.target[1], new_value)
 
         finally:
             self.source[0].observe(self._update_target, names=self.source[1])
@@ -360,22 +564,36 @@ class link:
     def _update_target(self, change: t.Any) -> None:
         if self.updating:
             return
+        new_value = self._transform(change.new)
+        stable = self.diagnostics.enabled and _link_values_equal(
+            getattr(self.target[0], self.target[1]), new_value
+        )
         with self._busy_updating():
-            setattr(self.target[0], self.target[1], self._transform(change.new))
-            if getattr(self.source[0], self.source[1]) != change.new:
-                raise TraitError(
-                    f"Broken link {self}: the source value changed while updating the target."
-                )
+            with self.diagnostics.track(
+                self.source, self.target, "->", detect=not stable, record=not stable
+            ):
+                setattr(self.target[0], self.target[1], new_value)
+                if getattr(self.source[0], self.source[1]) != change.new:
+                    raise TraitError(
+                        f"Broken link {self}: the source value changed while updating the target."
+                    )
 
     def _update_source(self, change: t.Any) -> None:
         if self.updating:
             return
+        new_value = self._transform_inv(change.new)
+        stable = self.diagnostics.enabled and _link_values_equal(
+            getattr(self.source[0], self.source[1]), new_value
+        )
         with self._busy_updating():
-            setattr(self.source[0], self.source[1], self._transform_inv(change.new))
-            if getattr(self.target[0], self.target[1]) != change.new:
-                raise TraitError(
-                    f"Broken link {self}: the target value changed while updating the source."
-                )
+            with self.diagnostics.track(
+                self.target, self.source, "<-", detect=not stable, record=not stable
+            ):
+                setattr(self.source[0], self.source[1], new_value)
+                if getattr(self.target[0], self.target[1]) != change.new:
+                    raise TraitError(
+                        f"Broken link {self}: the target value changed while updating the source."
+                    )
 
     def unlink(self) -> None:
         self.source[0].unobserve(self._update_target, names=self.source[1])
@@ -391,6 +609,9 @@ class directional_link:
     target : (object, attribute name) pair
     transform: callable (optional)
         Data transformation between source and target.
+    propagation_diagnostics: LinkPropagationDiagnostics, optional
+        Shared diagnostics used to detect an oscillating chain of links.
+        ``diagnostics`` is accepted as a shorter alias.
 
     Examples
     --------
@@ -415,19 +636,32 @@ class directional_link:
 
     updating = False
 
-    def __init__(self, source: t.Any, target: t.Any, transform: t.Any = None) -> None:
+    def __init__(
+        self,
+        source: t.Any,
+        target: t.Any,
+        transform: t.Any = None,
+        *,
+        diagnostics: LinkPropagationDiagnostics | None = None,
+        propagation_diagnostics: LinkPropagationDiagnostics | None = None,
+    ) -> None:
         self._transform = transform if transform else lambda x: x
         _validate_link(source, target)
         self.source, self.target = source, target
+        diagnostics = (
+            propagation_diagnostics if propagation_diagnostics is not None else diagnostics
+        )
+        self.diagnostics = diagnostics if diagnostics is not None else _NullLinkPropagation()
         self.link()
 
     def link(self) -> None:
         try:
-            setattr(
-                self.target[0],
-                self.target[1],
-                self._transform(getattr(self.source[0], self.source[1])),
-            )
+            new_value = self._transform(getattr(self.source[0], self.source[1]))
+            stable = _link_values_equal(getattr(self.target[0], self.target[1]), new_value)
+            with self.diagnostics.track(
+                self.source, self.target, "->", detect=False, record=not stable
+            ):
+                setattr(self.target[0], self.target[1], new_value)
         finally:
             self.source[0].observe(self._update, names=self.source[1])
 
@@ -442,8 +676,15 @@ class directional_link:
     def _update(self, change: t.Any) -> None:
         if self.updating:
             return
+        new_value = self._transform(change.new)
+        stable = self.diagnostics.enabled and _link_values_equal(
+            getattr(self.target[0], self.target[1]), new_value
+        )
         with self._busy_updating():
-            setattr(self.target[0], self.target[1], self._transform(change.new))
+            with self.diagnostics.track(
+                self.source, self.target, "->", detect=not stable, record=not stable
+            ):
+                setattr(self.target[0], self.target[1], new_value)
 
     def unlink(self) -> None:
         self.source[0].unobserve(self._update, names=self.source[1])

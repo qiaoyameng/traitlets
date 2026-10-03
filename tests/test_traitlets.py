@@ -11,6 +11,7 @@ import decimal
 import pathlib
 import pickle
 import re
+import threading
 import typing as t
 from unittest import TestCase, mock
 
@@ -41,6 +42,8 @@ from traitlets import (
     Instance,
     Int,
     Integer,
+    LinkCycleError,
+    LinkPropagationDiagnostics,
     List,
     Long,
     MetaHasTraits,
@@ -2216,6 +2219,207 @@ class TestLink(TestCase):
         mc = MyClass()
         l = link((mc, "i"), (mc, "j"))
         self.assertRaises(TraitError, setattr, mc, "j", 2)
+
+    def test_diagnostics_converging_two_way_link(self):
+        class A(HasTraits):
+            value = Int()
+
+        a = A(value=3)
+        b = A(value=6)
+        diagnostics = LinkPropagationDiagnostics()
+        notifications = []
+
+        a.observe(lambda change: notifications.append(("a", change.new)), names="value")
+        b.observe(lambda change: notifications.append(("b", change.new)), names="value")
+
+        link(
+            (a, "value"),
+            (b, "value"),
+            transform=(lambda value: value * 2, lambda value: value // 2),
+            diagnostics=diagnostics,
+        )
+
+        notifications.clear()
+        a.value = 5
+
+        self.assertEqual(b.value, 10)
+        self.assertEqual(notifications, [("a", 5), ("b", 10)])
+
+        notifications.clear()
+        b.value = 12
+
+        self.assertEqual(a.value, 6)
+        self.assertEqual(notifications, [("b", 12), ("a", 6)])
+
+    def test_diagnostics_three_transform_oscillating_links(self):
+        class A(HasTraits):
+            value = Int()
+
+        a = A(value=1)
+        b = A(value=2)
+        c = A(value=3)
+        diagnostics = LinkPropagationDiagnostics(max_steps=10)
+
+        links = [
+            directional_link(
+                (a, "value"),
+                (b, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            ),
+            directional_link(
+                (b, "value"),
+                (c, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            ),
+            directional_link(
+                (c, "value"),
+                (a, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            ),
+        ]
+
+        with pytest.raises(LinkCycleError) as exc_info:
+            a.value = 5
+
+        expected_endpoints = [f"A@0x{id(obj):x}.value" for obj in (a, b, c, a)]
+        self.assertEqual(
+            exc_info.value.cycle_path,
+            f"{expected_endpoints[0]} -> {expected_endpoints[1]} -> "
+            f"{expected_endpoints[2]} -> {expected_endpoints[3]}",
+        )
+        self.assertIn("Link propagation cycle detected", str(exc_info.value))
+        self.assertEqual(exc_info.value.steps, 3)
+
+        for linked in links:
+            self.assertFalse(linked.updating)
+
+        links[2].unlink()
+        notifications = []
+        b.observe(lambda change: notifications.append(change.new), names="value")
+        c.observe(lambda change: notifications.append(change.new), names="value")
+
+        a.value = 8
+
+        self.assertEqual((b.value, c.value), (9, 10))
+        self.assertEqual(notifications, [10, 9])
+        self.assertIsNone(diagnostics.current_path)
+
+    def test_diagnostics_stable_three_link_ring_stops_naturally(self):
+        class A(HasTraits):
+            value = Int()
+
+        a = A(value=7)
+        b = A(value=7)
+        c = A(value=7)
+        diagnostics = LinkPropagationDiagnostics(max_steps=10)
+
+        directional_link((a, "value"), (b, "value"), diagnostics=diagnostics)
+        directional_link((b, "value"), (c, "value"), diagnostics=diagnostics)
+        directional_link((c, "value"), (a, "value"), diagnostics=diagnostics)
+
+        a.value = 11
+
+        self.assertEqual((a.value, b.value, c.value), (11, 11, 11))
+        self.assertIsNone(diagnostics.current_path)
+
+    def test_diagnostics_stop_long_chain_after_max_steps(self):
+        class A(HasTraits):
+            value = Int()
+
+        objects = [A(value=0) for _ in range(4)]
+        diagnostics = LinkPropagationDiagnostics(max_steps=2)
+
+        for source, target in zip(objects, objects[1:]):
+            directional_link(
+                (source, "value"),
+                (target, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            )
+
+        with pytest.raises(LinkCycleError) as exc_info:
+            objects[0].value = 1
+
+        self.assertEqual(exc_info.value.steps, 3)
+        self.assertEqual(exc_info.value.max_steps, 2)
+        self.assertIsNone(diagnostics.current_path)
+
+    def test_diagnostics_error_clears_context_for_later_updates(self):
+        class A(HasTraits):
+            value = Int()
+
+        a = A(value=1)
+        b = A(value=2)
+        c = A(value=3)
+        diagnostics = LinkPropagationDiagnostics(max_steps=10)
+
+        linked = [
+            directional_link(
+                (a, "value"),
+                (b, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            ),
+            directional_link(
+                (b, "value"),
+                (c, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            ),
+            directional_link(
+                (c, "value"),
+                (a, "value"),
+                lambda value: value + 1,
+                diagnostics=diagnostics,
+            ),
+        ]
+
+        with pytest.raises(LinkCycleError):
+            a.value = 5
+
+        linked[2].unlink()
+        a.value = 6
+
+        self.assertEqual((b.value, c.value), (7, 8))
+
+    def test_diagnostics_do_not_share_propagation_between_threads(self):
+        class A(HasTraits):
+            value = Int()
+
+        a = A(value=1)
+        b = A(value=2)
+        c = A(value=3)
+        diagnostics = LinkPropagationDiagnostics(max_steps=10)
+        directional_link(
+            (a, "value"),
+            (b, "value"),
+            lambda value: value + 1,
+            diagnostics=diagnostics,
+        )
+        directional_link(
+            (b, "value"),
+            (c, "value"),
+            lambda value: value + 1,
+            diagnostics=diagnostics,
+        )
+
+        result = []
+
+        def update_in_thread():
+            try:
+                a.value = 4
+            except Exception as exc:
+                result.append(exc)
+
+        thread = threading.Thread(target=update_in_thread)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(result, [])
+        self.assertEqual((a.value, b.value, c.value), (4, 5, 6))
 
 
 class TestDirectionalLink(TestCase):
