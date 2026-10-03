@@ -43,3 +43,9 @@ Links
 .. autoclass:: link
 
 .. autoclass:: directional_link
+
+.. autoclass:: PropagationDiagnostics
+
+.. autoclass:: PropagationStep
+
+.. autoclass:: LinkCycleError

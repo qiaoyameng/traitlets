@@ -11,6 +11,7 @@ import decimal
 import pathlib
 import pickle
 import re
+import threading
 import typing as t
 from unittest import TestCase, mock
 
@@ -43,9 +44,11 @@ from traitlets import (
     Integer,
     List,
     Long,
+    LinkCycleError,
     MetaHasTraits,
     ObjectName,
     Path,
+    PropagationDiagnostics,
     Set,
     TCPAddress,
     This,
@@ -2217,6 +2220,29 @@ class TestLink(TestCase):
         l = link((mc, "i"), (mc, "j"))
         self.assertRaises(TraitError, setattr, mc, "j", 2)
 
+    def test_propagation_diagnostics_converging_link(self):
+        class Model(HasTraits):
+            value = Int()
+
+        a = Model()
+        b = Model()
+        changes = []
+        diagnostics = PropagationDiagnostics(max_steps=2)
+        c = link((a, "value"), (b, "value"), diagnostics=diagnostics)
+
+        b.observe(lambda change: changes.append(("b", change.new)), names="value")
+        a.value = 4
+
+        self.assertEqual((a.value, b.value), (4, 4))
+        self.assertEqual(changes, [("b", 4)])
+        self.assertFalse(diagnostics.active)
+
+        b.value = 7
+        self.assertEqual((a.value, b.value), (7, 7))
+        self.assertEqual(changes, [("b", 4), ("b", 7)])
+        self.assertFalse(diagnostics.active)
+        c.unlink()
+
 
 class TestDirectionalLink(TestCase):
     def test_connect_same(self):
@@ -2313,6 +2339,156 @@ class TestDirectionalLink(TestCase):
         self.assertEqual(a.value, b.value)
         a.value += 1
         self.assertEqual(a.value, b.value)
+
+    def test_propagation_diagnostics_directional_cycle(self):
+        class Model(HasTraits):
+            value = Int()
+
+        a, b, c = Model(), Model(), Model()
+        diagnostics = PropagationDiagnostics()
+        directional_link(
+            (a, "value"),
+            (b, "value"),
+            lambda value: value + 1,
+            diagnostics,
+        )
+        directional_link(
+            (b, "value"),
+            (c, "value"),
+            lambda value: value + 1,
+            diagnostics,
+        )
+        directional_link(
+            (c, "value"),
+            (a, "value"),
+            lambda value: value + 1,
+            diagnostics,
+        )
+
+        with pytest.raises(LinkCycleError) as exc_info:
+            a.value = 10
+
+        error = exc_info.value
+        self.assertEqual(len(error.path), 4)
+        self.assertEqual(error.path[0], error.path[-1])
+        self.assertIn("Model@", str(error))
+        self.assertIn("forward", str(error))
+        self.assertFalse(diagnostics.active)
+
+    def test_propagation_diagnostics_max_steps(self):
+        class Model(HasTraits):
+            value = Int()
+
+        a, b, c = Model(), Model(), Model()
+        diagnostics = PropagationDiagnostics(max_steps=2)
+        directional_link((a, "value"), (b, "value"), lambda value: value + 1, diagnostics)
+        directional_link((b, "value"), (c, "value"), lambda value: value + 1, diagnostics)
+        directional_link((c, "value"), (a, "value"), lambda value: value + 1, diagnostics)
+
+        with pytest.raises(LinkCycleError, match="max_steps=2"):
+            a.value = 1
+        self.assertFalse(diagnostics.active)
+
+    def test_propagation_diagnostics_threads_are_isolated(self):
+        class Model(HasTraits):
+            value = Int()
+
+        source = Model()
+        target = Model()
+        diagnostics = PropagationDiagnostics()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def wait_for_main_thread(value):
+            if value:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError
+            return value
+
+        directional_link((source, "value"), (target, "value"), wait_for_main_thread, diagnostics)
+
+        worker = threading.Thread(target=lambda: setattr(source, "value", 1))
+        worker.start()
+        self.assertTrue(entered.wait(5))
+        self.assertFalse(diagnostics.active)
+
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(target.value, 1)
+
+    def test_propagation_diagnostics_cleared_after_transform_error(self):
+        class Model(HasTraits):
+            value = Int()
+
+        a, b = Model(), Model()
+        diagnostics = PropagationDiagnostics()
+
+        def fail_on_five(value):
+            if value == 5:
+                raise ValueError("boom")
+            return value
+
+        c = directional_link((a, "value"), (b, "value"), fail_on_five, diagnostics)
+
+        with pytest.raises(ValueError, match="boom"):
+            a.value = 5
+
+        self.assertFalse(diagnostics.active)
+        a.value = 6
+        self.assertEqual(b.value, 6)
+        c.unlink()
+
+
+class TestPropagationDiagnosticsLinkCycles(TestCase):
+    def test_transformed_link_cycle_unlink_restores_notifications(self):
+        class Model(HasTraits):
+            value = Int()
+
+        a, b, c = Model(), Model(), Model()
+        diagnostics = PropagationDiagnostics()
+        links = [
+            link(
+                (a, "value"),
+                (b, "value"),
+                transform=(lambda value: value + 1, lambda value: value - 1),
+                diagnostics=diagnostics,
+            ),
+            link(
+                (b, "value"),
+                (c, "value"),
+                transform=(lambda value: value + 1, lambda value: value - 1),
+                diagnostics=diagnostics,
+            ),
+            link(
+                (c, "value"),
+                (a, "value"),
+                transform=(lambda value: value + 1, lambda value: value - 1),
+                diagnostics=diagnostics,
+            ),
+        ]
+        changes = []
+        c.observe(lambda change: changes.append(change.new), names="value")
+
+        with pytest.raises(LinkCycleError) as exc_info:
+            a.value = 0
+
+        error = exc_info.value
+        self.assertEqual(len(error.steps), 3)
+        self.assertEqual(
+            error.path,
+            ((a, "value"), (b, "value"), (c, "value"), (a, "value")),
+        )
+        self.assertFalse(diagnostics.active)
+
+        links[-1].unlink()
+        changes.clear()
+        a.value = 10
+
+        self.assertEqual((a.value, b.value, c.value), (10, 11, 12))
+        self.assertEqual(changes, [12])
+        self.assertFalse(diagnostics.active)
 
 
 class Pickleable(HasTraits):
